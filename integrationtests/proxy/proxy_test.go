@@ -61,9 +61,12 @@ var _ = Describe("QUIC Proxy", func() {
 			// check that the proxy port is not in use anymore
 			addr, err := net.ResolveUDPAddr("udp", "localhost:"+strconv.Itoa(port))
 			Expect(err).ToNot(HaveOccurred())
-			ln, err := net.ListenUDP("udp", addr)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(ln.Close()).To(Succeed())
+			// sometimes it takes a while for the OS to free the port
+			Eventually(func() error {
+				ln, err := net.ListenUDP("udp", addr)
+				defer ln.Close()
+				return err
+			}).ShouldNot(HaveOccurred())
 		})
 
 		It("has the correct LocalAddr and LocalPort", func() {
