@@ -2,6 +2,7 @@ package quic
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/bifurcation/mint"
 	"github.com/golang/mock/gomock"
 	"github.com/lucas-clemente/quic-go/internal/handshake"
 	"github.com/lucas-clemente/quic-go/internal/protocol"
@@ -22,12 +24,16 @@ import (
 
 var _ = Describe("Client", func() {
 	var (
-		cl         *client
-		packetConn *mockPacketConn
-		addr       net.Addr
-		connID     protocol.ConnectionID
+		cl              *client
+		packetConn      *mockPacketConn
+		addr            net.Addr
+		connID          protocol.ConnectionID
+		mockMultiplexer *MockMultiplexer
+		origMultiplexer multiplexer
 
-		originalClientSessConstructor func(connection, sessionRunner, string, protocol.VersionNumber, protocol.ConnectionID, *tls.Config, *Config, protocol.VersionNumber, []protocol.VersionNumber, utils.Logger) (packetHandler, error)
+		supportedVersionsWithoutGQUIC44 []protocol.VersionNumber
+
+		originalClientSessConstructor func(connection, sessionRunner, string, protocol.VersionNumber, protocol.ConnectionID, protocol.ConnectionID, *tls.Config, *Config, protocol.VersionNumber, []protocol.VersionNumber, utils.Logger) (quicSession, error)
 	)
 
 	// generate a packet sent by the server that accepts the QUIC version suggested by the client
@@ -35,20 +41,29 @@ var _ = Describe("Client", func() {
 		b := &bytes.Buffer{}
 		err := (&wire.Header{
 			DestConnectionID: connID,
-			SrcConnectionID:  connID,
 			PacketNumber:     1,
 			PacketNumberLen:  1,
 		}).Write(b, protocol.PerspectiveServer, protocol.VersionWhatever)
 		Expect(err).ToNot(HaveOccurred())
 		return b.Bytes()
 	}
-	_ = acceptClientVersionPacket
+
+	composeVersionNegotiationPacket := func(connID protocol.ConnectionID, versions []protocol.VersionNumber) *receivedPacket {
+		return &receivedPacket{
+			rcvTime: time.Now(),
+			header: &wire.Header{
+				IsVersionNegotiation: true,
+				DestConnectionID:     connID,
+				SupportedVersions:    versions,
+			},
+		}
+	}
 
 	BeforeEach(func() {
 		connID = protocol.ConnectionID{0, 0, 0, 0, 0, 0, 0x13, 0x37}
 		originalClientSessConstructor = newClientSession
 		Eventually(areSessionsRunning).Should(BeFalse())
-		// sess = NewMockPacketHandler(mockCtrl)
+		// sess = NewMockQuicSession(mockCtrl)
 		addr = &net.UDPAddr{IP: net.IPv4(192, 168, 100, 200), Port: 1337}
 		packetConn = newMockPacketConn()
 		packetConn.addr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1234}
@@ -60,34 +75,56 @@ var _ = Describe("Client", func() {
 			conn:       &conn{pconn: packetConn, currentAddr: addr},
 			logger:     utils.DefaultLogger,
 		}
+		getMultiplexer() // make the sync.Once execute
+		// replace the clientMuxer. getClientMultiplexer will now return the MockMultiplexer
+		mockMultiplexer = NewMockMultiplexer(mockCtrl)
+		origMultiplexer = connMuxer
+		connMuxer = mockMultiplexer
+		for _, v := range protocol.SupportedVersions {
+			if v != protocol.Version44 {
+				supportedVersionsWithoutGQUIC44 = append(supportedVersionsWithoutGQUIC44, v)
+			}
+		}
+		Expect(supportedVersionsWithoutGQUIC44).ToNot(BeEmpty())
 	})
 
 	AfterEach(func() {
+		connMuxer = origMultiplexer
 		newClientSession = originalClientSessConstructor
 	})
 
 	AfterEach(func() {
 		if s, ok := cl.session.(*session); ok {
-			s.Close(nil)
+			s.Close()
 		}
 		Eventually(areSessionsRunning).Should(BeFalse())
 	})
 
 	Context("Dialing", func() {
-		var origGenerateConnectionID func() (protocol.ConnectionID, error)
+		var origGenerateConnectionID func(int) (protocol.ConnectionID, error)
+		var origGenerateConnectionIDForInitial func() (protocol.ConnectionID, error)
 
 		BeforeEach(func() {
 			origGenerateConnectionID = generateConnectionID
-			generateConnectionID = func() (protocol.ConnectionID, error) {
+			origGenerateConnectionIDForInitial = generateConnectionIDForInitial
+			generateConnectionID = func(int) (protocol.ConnectionID, error) {
+				return connID, nil
+			}
+			generateConnectionIDForInitial = func() (protocol.ConnectionID, error) {
 				return connID, nil
 			}
 		})
 
 		AfterEach(func() {
 			generateConnectionID = origGenerateConnectionID
+			generateConnectionIDForInitial = origGenerateConnectionIDForInitial
 		})
 
 		It("resolves the address", func() {
+			manager := NewMockPacketHandlerManager(mockCtrl)
+			manager.EXPECT().Add(gomock.Any(), gomock.Any())
+			mockMultiplexer.EXPECT().AddConn(gomock.Any(), gomock.Any()).Return(manager, nil)
+
 			if os.Getenv("APPVEYOR") == "True" {
 				Skip("This test is flaky on AppVeyor.")
 			}
@@ -98,14 +135,15 @@ var _ = Describe("Client", func() {
 				_ string,
 				_ protocol.VersionNumber,
 				_ protocol.ConnectionID,
+				_ protocol.ConnectionID,
 				_ *tls.Config,
 				_ *Config,
 				_ protocol.VersionNumber,
 				_ []protocol.VersionNumber,
 				_ utils.Logger,
-			) (packetHandler, error) {
+			) (quicSession, error) {
 				remoteAddrChan <- conn.RemoteAddr().String()
-				sess := NewMockPacketHandler(mockCtrl)
+				sess := NewMockQuicSession(mockCtrl)
 				sess.EXPECT().run()
 				return sess, nil
 			}
@@ -115,6 +153,10 @@ var _ = Describe("Client", func() {
 		})
 
 		It("uses the tls.Config.ServerName as the hostname, if present", func() {
+			manager := NewMockPacketHandlerManager(mockCtrl)
+			manager.EXPECT().Add(gomock.Any(), gomock.Any())
+			mockMultiplexer.EXPECT().AddConn(gomock.Any(), gomock.Any()).Return(manager, nil)
+
 			hostnameChan := make(chan string, 1)
 			newClientSession = func(
 				_ connection,
@@ -122,14 +164,15 @@ var _ = Describe("Client", func() {
 				h string,
 				_ protocol.VersionNumber,
 				_ protocol.ConnectionID,
+				_ protocol.ConnectionID,
 				_ *tls.Config,
 				_ *Config,
 				_ protocol.VersionNumber,
 				_ []protocol.VersionNumber,
 				_ utils.Logger,
-			) (packetHandler, error) {
+			) (quicSession, error) {
 				hostnameChan <- h
-				sess := NewMockPacketHandler(mockCtrl)
+				sess := NewMockQuicSession(mockCtrl)
 				sess.EXPECT().run()
 				return sess, nil
 			}
@@ -138,14 +181,11 @@ var _ = Describe("Client", func() {
 			Eventually(hostnameChan).Should(Receive(Equal("foobar")))
 		})
 
-		It("errors when receiving an error from the connection", func() {
-			testErr := errors.New("connection error")
-			packetConn.readErr = testErr
-			_, err := Dial(packetConn, addr, "quic.clemente.io:1337", nil, nil)
-			Expect(err).To(MatchError(testErr))
-		})
-
 		It("returns after the handshake is complete", func() {
+			manager := NewMockPacketHandlerManager(mockCtrl)
+			manager.EXPECT().Add(gomock.Any(), gomock.Any())
+			mockMultiplexer.EXPECT().AddConn(packetConn, gomock.Any()).Return(manager, nil)
+
 			run := make(chan struct{})
 			newClientSession = func(
 				_ connection,
@@ -153,49 +193,213 @@ var _ = Describe("Client", func() {
 				_ string,
 				_ protocol.VersionNumber,
 				_ protocol.ConnectionID,
-				_ *tls.Config,
-				_ *Config,
-				_ protocol.VersionNumber,
-				_ []protocol.VersionNumber,
-				_ utils.Logger,
-			) (packetHandler, error) {
-				sess := NewMockPacketHandler(mockCtrl)
-				sess.EXPECT().run().Do(func() { close(run) })
-				sess.EXPECT().handlePacket(gomock.Any())
-				runner.onHandshakeComplete(sess)
-				return sess, nil
-			}
-			packetConn.dataToRead <- acceptClientVersionPacket(cl.srcConnID)
-			s, err := Dial(packetConn, addr, "quic.clemente.io:1337", nil, nil)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(s).ToNot(BeNil())
-			Eventually(run).Should(BeClosed())
-		})
-
-		It("returns an error that occurs while waiting for the connection to become secure", func() {
-			testErr := errors.New("early handshake error")
-			handledPacket := make(chan struct{})
-			newClientSession = func(
-				conn connection,
-				_ sessionRunner,
-				_ string,
-				_ protocol.VersionNumber,
 				_ protocol.ConnectionID,
 				_ *tls.Config,
 				_ *Config,
 				_ protocol.VersionNumber,
 				_ []protocol.VersionNumber,
 				_ utils.Logger,
-			) (packetHandler, error) {
-				sess := NewMockPacketHandler(mockCtrl)
-				sess.EXPECT().handlePacket(gomock.Any()).Do(func(_ *receivedPacket) { close(handledPacket) })
+			) (quicSession, error) {
+				sess := NewMockQuicSession(mockCtrl)
+				sess.EXPECT().run().Do(func() { close(run) })
+				runner.onHandshakeComplete(sess)
+				return sess, nil
+			}
+			s, err := Dial(
+				packetConn,
+				addr,
+				"quic.clemente.io:1337",
+				nil,
+				&Config{Versions: supportedVersionsWithoutGQUIC44},
+			)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(s).ToNot(BeNil())
+			Eventually(run).Should(BeClosed())
+		})
+
+		It("refuses to multiplex gQUIC 44", func() {
+			_, err := Dial(
+				packetConn,
+				addr,
+				"quic.clemente.io:1337",
+				nil,
+				&Config{Versions: []protocol.VersionNumber{protocol.Version44}},
+			)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("Cannot multiplex connections using gQUIC 44"))
+		})
+
+		It("returns an error that occurs while waiting for the connection to become secure", func() {
+			manager := NewMockPacketHandlerManager(mockCtrl)
+			manager.EXPECT().Add(gomock.Any(), gomock.Any())
+			mockMultiplexer.EXPECT().AddConn(packetConn, gomock.Any()).Return(manager, nil)
+
+			testErr := errors.New("early handshake error")
+			newClientSession = func(
+				conn connection,
+				_ sessionRunner,
+				_ string,
+				_ protocol.VersionNumber,
+				_ protocol.ConnectionID,
+				_ protocol.ConnectionID,
+				_ *tls.Config,
+				_ *Config,
+				_ protocol.VersionNumber,
+				_ []protocol.VersionNumber,
+				_ utils.Logger,
+			) (quicSession, error) {
+				sess := NewMockQuicSession(mockCtrl)
 				sess.EXPECT().run().Return(testErr)
 				return sess, nil
 			}
 			packetConn.dataToRead <- acceptClientVersionPacket(cl.srcConnID)
-			_, err := Dial(packetConn, addr, "quic.clemente.io:1337", nil, nil)
+			_, err := Dial(
+				packetConn,
+				addr,
+				"quic.clemente.io:1337",
+				nil,
+				&Config{Versions: supportedVersionsWithoutGQUIC44},
+			)
 			Expect(err).To(MatchError(testErr))
-			Eventually(handledPacket).Should(BeClosed())
+		})
+
+		It("closes the session when the context is canceled", func() {
+			manager := NewMockPacketHandlerManager(mockCtrl)
+			manager.EXPECT().Add(gomock.Any(), gomock.Any())
+			mockMultiplexer.EXPECT().AddConn(packetConn, gomock.Any()).Return(manager, nil)
+
+			sessionRunning := make(chan struct{})
+			defer close(sessionRunning)
+			sess := NewMockQuicSession(mockCtrl)
+			sess.EXPECT().run().Do(func() {
+				<-sessionRunning
+			})
+			newClientSession = func(
+				conn connection,
+				_ sessionRunner,
+				_ string,
+				_ protocol.VersionNumber,
+				_ protocol.ConnectionID,
+				_ protocol.ConnectionID,
+				_ *tls.Config,
+				_ *Config,
+				_ protocol.VersionNumber,
+				_ []protocol.VersionNumber,
+				_ utils.Logger,
+			) (quicSession, error) {
+				return sess, nil
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			dialed := make(chan struct{})
+			go func() {
+				defer GinkgoRecover()
+				_, err := DialContext(
+					ctx,
+					packetConn,
+					addr,
+					"quic.clemnte.io:1337",
+					nil,
+					&Config{Versions: supportedVersionsWithoutGQUIC44},
+				)
+				Expect(err).To(MatchError(context.Canceled))
+				close(dialed)
+			}()
+			Consistently(dialed).ShouldNot(BeClosed())
+			sess.EXPECT().Close()
+			cancel()
+			Eventually(dialed).Should(BeClosed())
+		})
+
+		It("removes closed sessions from the multiplexer", func() {
+			manager := NewMockPacketHandlerManager(mockCtrl)
+			manager.EXPECT().Add(connID, gomock.Any())
+			manager.EXPECT().Remove(connID)
+			mockMultiplexer.EXPECT().AddConn(packetConn, gomock.Any()).Return(manager, nil)
+
+			var runner sessionRunner
+			sess := NewMockQuicSession(mockCtrl)
+			newClientSession = func(
+				conn connection,
+				runnerP sessionRunner,
+				_ string,
+				_ protocol.VersionNumber,
+				_ protocol.ConnectionID,
+				_ protocol.ConnectionID,
+				_ *tls.Config,
+				_ *Config,
+				_ protocol.VersionNumber,
+				_ []protocol.VersionNumber,
+				_ utils.Logger,
+			) (quicSession, error) {
+				runner = runnerP
+				return sess, nil
+			}
+			sess.EXPECT().run().Do(func() {
+				runner.removeConnectionID(connID)
+			})
+
+			_, err := DialContext(
+				context.Background(),
+				packetConn,
+				addr,
+				"quic.clemnte.io:1337",
+				nil,
+				&Config{Versions: supportedVersionsWithoutGQUIC44},
+			)
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("closes the connection when it was created by DialAddr", func() {
+			manager := NewMockPacketHandlerManager(mockCtrl)
+			mockMultiplexer.EXPECT().AddConn(gomock.Any(), gomock.Any()).Return(manager, nil)
+			manager.EXPECT().Add(gomock.Any(), gomock.Any())
+
+			var conn connection
+			run := make(chan struct{})
+			sessionCreated := make(chan struct{})
+			sess := NewMockQuicSession(mockCtrl)
+			newClientSession = func(
+				connP connection,
+				_ sessionRunner,
+				_ string,
+				_ protocol.VersionNumber,
+				_ protocol.ConnectionID,
+				_ protocol.ConnectionID,
+				_ *tls.Config,
+				_ *Config,
+				_ protocol.VersionNumber,
+				_ []protocol.VersionNumber,
+				_ utils.Logger,
+			) (quicSession, error) {
+				conn = connP
+				close(sessionCreated)
+				return sess, nil
+			}
+			sess.EXPECT().run().Do(func() {
+				<-run
+			})
+
+			done := make(chan struct{})
+			go func() {
+				defer GinkgoRecover()
+				_, err := DialAddr("quic.clemente.io:1337", nil, nil)
+				Expect(err).ToNot(HaveOccurred())
+				close(done)
+			}()
+
+			Eventually(sessionCreated).Should(BeClosed())
+
+			// check that the connection is not closed
+			Expect(conn.Write([]byte("foobar"))).To(Succeed())
+
+			close(run)
+			time.Sleep(50 * time.Millisecond)
+			// check that the connection is closed
+			err := conn.Write([]byte("foobar"))
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("use of closed network connection"))
+
+			Eventually(done).Should(BeClosed())
 		})
 
 		Context("quic.Config", func() {
@@ -206,18 +410,40 @@ var _ = Describe("Client", func() {
 					RequestConnectionIDOmission: true,
 					MaxIncomingStreams:          1234,
 					MaxIncomingUniStreams:       4321,
+					ConnectionIDLength:          13,
+					Versions:                    supportedVersionsWithoutGQUIC44,
 				}
-				c := populateClientConfig(config)
+				c := populateClientConfig(config, false)
 				Expect(c.HandshakeTimeout).To(Equal(1337 * time.Minute))
 				Expect(c.IdleTimeout).To(Equal(42 * time.Hour))
 				Expect(c.RequestConnectionIDOmission).To(BeTrue())
 				Expect(c.MaxIncomingStreams).To(Equal(1234))
 				Expect(c.MaxIncomingUniStreams).To(Equal(4321))
+				Expect(c.ConnectionIDLength).To(Equal(13))
+			})
+
+			It("uses a 0 byte connection IDs if gQUIC 44 is supported", func() {
+				config := &Config{
+					Versions:           []protocol.VersionNumber{protocol.Version43, protocol.Version44},
+					ConnectionIDLength: 13,
+				}
+				c := populateClientConfig(config, false)
+				Expect(c.Versions).To(Equal([]protocol.VersionNumber{protocol.Version43, protocol.Version44}))
+				Expect(c.ConnectionIDLength).To(BeZero())
+			})
+
+			It("doesn't use 0-byte connection IDs when dialing an address", func() {
+				config := &Config{Versions: supportedVersionsWithoutGQUIC44}
+				c := populateClientConfig(config, false)
+				Expect(c.ConnectionIDLength).To(Equal(protocol.DefaultConnectionIDLength))
 			})
 
 			It("errors when the Config contains an invalid version", func() {
+				manager := NewMockPacketHandlerManager(mockCtrl)
+				mockMultiplexer.EXPECT().AddConn(packetConn, gomock.Any()).Return(manager, nil)
+
 				version := protocol.VersionNumber(0x1234)
-				_, err := Dial(nil, nil, "localhost:1234", &tls.Config{}, &Config{Versions: []protocol.VersionNumber{version}})
+				_, err := Dial(packetConn, nil, "localhost:1234", &tls.Config{}, &Config{Versions: []protocol.VersionNumber{version}})
 				Expect(err).To(MatchError("0x1234 is not a valid QUIC version"))
 			})
 
@@ -226,7 +452,7 @@ var _ = Describe("Client", func() {
 					MaxIncomingStreams:    -1,
 					MaxIncomingUniStreams: 4321,
 				}
-				c := populateClientConfig(config)
+				c := populateClientConfig(config, false)
 				Expect(c.MaxIncomingStreams).To(BeZero())
 				Expect(c.MaxIncomingUniStreams).To(Equal(4321))
 			})
@@ -236,13 +462,19 @@ var _ = Describe("Client", func() {
 					MaxIncomingStreams:    1234,
 					MaxIncomingUniStreams: -1,
 				}
-				c := populateClientConfig(config)
+				c := populateClientConfig(config, false)
 				Expect(c.MaxIncomingStreams).To(Equal(1234))
 				Expect(c.MaxIncomingUniStreams).To(BeZero())
 			})
 
+			It("uses 0-byte connection IDs when dialing an address", func() {
+				config := &Config{}
+				c := populateClientConfig(config, true)
+				Expect(c.ConnectionIDLength).To(BeZero())
+			})
+
 			It("fills in default values if options are not set in the Config", func() {
-				c := populateClientConfig(&Config{})
+				c := populateClientConfig(&Config{}, false)
 				Expect(c.Versions).To(Equal(protocol.SupportedVersions))
 				Expect(c.HandshakeTimeout).To(Equal(protocol.DefaultHandshakeTimeout))
 				Expect(c.IdleTimeout).To(Equal(protocol.DefaultIdleTimeout))
@@ -252,6 +484,9 @@ var _ = Describe("Client", func() {
 
 		Context("gQUIC", func() {
 			It("errors if it can't create a session", func() {
+				manager := NewMockPacketHandlerManager(mockCtrl)
+				mockMultiplexer.EXPECT().AddConn(packetConn, gomock.Any()).Return(manager, nil)
+
 				testErr := errors.New("error creating session")
 				newClientSession = func(
 					_ connection,
@@ -259,47 +494,56 @@ var _ = Describe("Client", func() {
 					_ string,
 					_ protocol.VersionNumber,
 					_ protocol.ConnectionID,
+					_ protocol.ConnectionID,
 					_ *tls.Config,
 					_ *Config,
 					_ protocol.VersionNumber,
 					_ []protocol.VersionNumber,
 					_ utils.Logger,
-				) (packetHandler, error) {
+				) (quicSession, error) {
 					return nil, testErr
 				}
-				_, err := Dial(packetConn, addr, "quic.clemente.io:1337", nil, nil)
+				_, err := Dial(
+					packetConn,
+					addr,
+					"quic.clemente.io:1337",
+					nil,
+					&Config{Versions: supportedVersionsWithoutGQUIC44},
+				)
 				Expect(err).To(MatchError(testErr))
 			})
 		})
 
 		Context("IETF QUIC", func() {
 			It("creates new TLS sessions with the right parameters", func() {
+				manager := NewMockPacketHandlerManager(mockCtrl)
+				manager.EXPECT().Add(connID, gomock.Any())
+				mockMultiplexer.EXPECT().AddConn(packetConn, gomock.Any()).Return(manager, nil)
+
 				config := &Config{Versions: []protocol.VersionNumber{protocol.VersionTLS}}
 				c := make(chan struct{})
 				var cconn connection
-				var hostname string
 				var version protocol.VersionNumber
 				var conf *Config
 				newTLSClientSession = func(
 					connP connection,
 					_ sessionRunner,
-					hostnameP string,
-					versionP protocol.VersionNumber,
+					tokenP []byte,
 					_ protocol.ConnectionID,
 					_ protocol.ConnectionID,
 					configP *Config,
-					tls handshake.MintTLS,
+					_ *mint.Config,
 					paramsChan <-chan handshake.TransportParameters,
 					_ protocol.PacketNumber,
 					_ utils.Logger,
-				) (packetHandler, error) {
+					versionP protocol.VersionNumber,
+				) (quicSession, error) {
 					cconn = connP
-					hostname = hostnameP
 					version = versionP
 					conf = configP
 					close(c)
 					// TODO: check connection IDs?
-					sess := NewMockPacketHandler(mockCtrl)
+					sess := NewMockQuicSession(mockCtrl)
 					sess.EXPECT().run()
 					return sess, nil
 				}
@@ -307,9 +551,114 @@ var _ = Describe("Client", func() {
 				Expect(err).ToNot(HaveOccurred())
 				Eventually(c).Should(BeClosed())
 				Expect(cconn.(*conn).pconn).To(Equal(packetConn))
-				Expect(hostname).To(Equal("quic.clemente.io"))
 				Expect(version).To(Equal(config.Versions[0]))
 				Expect(conf.Versions).To(Equal(config.Versions))
+			})
+
+			It("creates a new session when the server performs a retry", func() {
+				manager := NewMockPacketHandlerManager(mockCtrl)
+				manager.EXPECT().Add(gomock.Any(), gomock.Any()).Do(func(id protocol.ConnectionID, handler packetHandler) {
+					go handler.handlePacket(&receivedPacket{
+						header: &wire.Header{
+							IsLongHeader:         true,
+							Type:                 protocol.PacketTypeRetry,
+							Token:                []byte("foobar"),
+							DestConnectionID:     id,
+							OrigDestConnectionID: connID,
+						},
+					})
+				})
+				manager.EXPECT().Add(gomock.Any(), gomock.Any())
+				mockMultiplexer.EXPECT().AddConn(packetConn, gomock.Any()).Return(manager, nil)
+
+				config := &Config{Versions: []protocol.VersionNumber{protocol.VersionTLS}}
+				cl.config = config
+				run1 := make(chan error)
+				sess1 := NewMockQuicSession(mockCtrl)
+				sess1.EXPECT().run().DoAndReturn(func() error {
+					return <-run1
+				})
+				sess1.EXPECT().destroy(errCloseSessionForRetry).Do(func(e error) {
+					run1 <- e
+				})
+				sess2 := NewMockQuicSession(mockCtrl)
+				sess2.EXPECT().run()
+				sessions := make(chan quicSession, 2)
+				sessions <- sess1
+				sessions <- sess2
+				newTLSClientSession = func(
+					_ connection,
+					_ sessionRunner,
+					_ []byte,
+					_ protocol.ConnectionID,
+					_ protocol.ConnectionID,
+					_ *Config,
+					_ *mint.Config,
+					_ <-chan handshake.TransportParameters,
+					_ protocol.PacketNumber,
+					_ utils.Logger,
+					_ protocol.VersionNumber,
+				) (quicSession, error) {
+					return <-sessions, nil
+				}
+				_, err := Dial(packetConn, addr, "quic.clemente.io:1337", nil, config)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(sessions).To(BeEmpty())
+			})
+
+			It("only accepts 3 retries", func() {
+				manager := NewMockPacketHandlerManager(mockCtrl)
+				manager.EXPECT().Add(gomock.Any(), gomock.Any()).Do(func(id protocol.ConnectionID, handler packetHandler) {
+					go handler.handlePacket(&receivedPacket{
+						header: &wire.Header{
+							IsLongHeader:         true,
+							Type:                 protocol.PacketTypeRetry,
+							Token:                []byte("foobar"),
+							SrcConnectionID:      connID,
+							DestConnectionID:     id,
+							OrigDestConnectionID: connID,
+							Version:              protocol.VersionTLS,
+						},
+					})
+				}).AnyTimes()
+				manager.EXPECT().Add(gomock.Any(), gomock.Any()).AnyTimes()
+				mockMultiplexer.EXPECT().AddConn(packetConn, gomock.Any()).Return(manager, nil)
+
+				config := &Config{Versions: []protocol.VersionNumber{protocol.VersionTLS}}
+				cl.config = config
+
+				sessions := make(chan quicSession, protocol.MaxRetries+1)
+				for i := 0; i < protocol.MaxRetries+1; i++ {
+					run := make(chan error)
+					sess := NewMockQuicSession(mockCtrl)
+					sess.EXPECT().run().DoAndReturn(func() error {
+						return <-run
+					})
+					sess.EXPECT().destroy(gomock.Any()).Do(func(e error) {
+						run <- e
+					})
+					sessions <- sess
+				}
+
+				newTLSClientSession = func(
+					_ connection,
+					_ sessionRunner,
+					_ []byte,
+					_ protocol.ConnectionID,
+					_ protocol.ConnectionID,
+					_ *Config,
+					_ *mint.Config,
+					_ <-chan handshake.TransportParameters,
+					_ protocol.PacketNumber,
+					_ utils.Logger,
+					_ protocol.VersionNumber,
+				) (quicSession, error) {
+					return <-sessions, nil
+				}
+				_, err := Dial(packetConn, addr, "quic.clemente.io:1337", nil, config)
+				Expect(err).To(HaveOccurred())
+				Expect(err.(qerr.ErrorCode)).To(Equal(qerr.CryptoTooManyRejects))
+				Expect(sessions).To(BeEmpty())
 			})
 		})
 
@@ -326,6 +675,10 @@ var _ = Describe("Client", func() {
 			})
 
 			It("returns an error that occurs during version negotiation", func() {
+				manager := NewMockPacketHandlerManager(mockCtrl)
+				manager.EXPECT().Add(connID, gomock.Any())
+				mockMultiplexer.EXPECT().AddConn(packetConn, gomock.Any()).Return(manager, nil)
+
 				testErr := errors.New("early handshake error")
 				newClientSession = func(
 					conn connection,
@@ -333,50 +686,59 @@ var _ = Describe("Client", func() {
 					_ string,
 					_ protocol.VersionNumber,
 					_ protocol.ConnectionID,
+					_ protocol.ConnectionID,
 					_ *tls.Config,
 					_ *Config,
 					_ protocol.VersionNumber,
 					_ []protocol.VersionNumber,
 					_ utils.Logger,
-				) (packetHandler, error) {
+				) (quicSession, error) {
 					Expect(conn.Write([]byte("0 fake CHLO"))).To(Succeed())
-					sess := NewMockPacketHandler(mockCtrl)
+					sess := NewMockQuicSession(mockCtrl)
 					sess.EXPECT().run().Return(testErr)
 					return sess, nil
 				}
-				_, err := Dial(packetConn, addr, "quic.clemente.io:1337", nil, nil)
+				_, err := Dial(
+					packetConn,
+					addr,
+					"quic.clemente.io:1337",
+					nil,
+					&Config{Versions: supportedVersionsWithoutGQUIC44},
+				)
 				Expect(err).To(MatchError(testErr))
 			})
 
 			It("recognizes that a packet without VersionFlag means that the server accepted the suggested version", func() {
-				sess := NewMockPacketHandler(mockCtrl)
+				sess := NewMockQuicSession(mockCtrl)
 				sess.EXPECT().handlePacket(gomock.Any())
 				cl.session = sess
-				ph := wire.Header{
+				cl.config = &Config{}
+				ph := &wire.Header{
 					PacketNumber:     1,
 					PacketNumberLen:  protocol.PacketNumberLen2,
 					DestConnectionID: connID,
 					SrcConnectionID:  connID,
 				}
-				b := &bytes.Buffer{}
-				err := ph.Write(b, protocol.PerspectiveServer, protocol.VersionWhatever)
-				Expect(err).ToNot(HaveOccurred())
-				err = cl.handlePacket(nil, b.Bytes())
+				err := cl.handlePacketImpl(&receivedPacket{header: ph})
 				Expect(err).ToNot(HaveOccurred())
 				Expect(cl.versionNegotiated).To(BeTrue())
 			})
 
-			It("changes the version after receiving a version negotiation packet", func() {
+			It("changes the version after receiving a Version Negotiation Packet", func() {
+				phm := NewMockPacketHandlerManager(mockCtrl)
+				phm.EXPECT().Add(connID, gomock.Any()).Times(2)
+				cl.packetHandlers = phm
+
 				version1 := protocol.Version39
 				version2 := protocol.Version39 + 1
 				Expect(version2.UsesTLS()).To(BeFalse())
-				sess1 := NewMockPacketHandler(mockCtrl)
+				sess1 := NewMockQuicSession(mockCtrl)
 				run1 := make(chan struct{})
 				sess1.EXPECT().run().Do(func() { <-run1 }).Return(errCloseSessionForNewVersion)
-				sess1.EXPECT().Close(errCloseSessionForNewVersion).Do(func(error) { close(run1) })
-				sess2 := NewMockPacketHandler(mockCtrl)
+				sess1.EXPECT().destroy(errCloseSessionForNewVersion).Do(func(error) { close(run1) })
+				sess2 := NewMockQuicSession(mockCtrl)
 				sess2.EXPECT().run()
-				sessionChan := make(chan *MockPacketHandler, 2)
+				sessionChan := make(chan *MockQuicSession, 2)
 				sessionChan <- sess1
 				sessionChan <- sess2
 				newClientSession = func(
@@ -384,13 +746,14 @@ var _ = Describe("Client", func() {
 					_ sessionRunner,
 					_ string,
 					_ protocol.VersionNumber,
-					connectionID protocol.ConnectionID,
+					_ protocol.ConnectionID,
+					_ protocol.ConnectionID,
 					_ *tls.Config,
 					_ *Config,
 					_ protocol.VersionNumber,
 					_ []protocol.VersionNumber,
 					_ utils.Logger,
-				) (packetHandler, error) {
+				) (quicSession, error) {
 					return <-sessionChan, nil
 				}
 
@@ -398,29 +761,31 @@ var _ = Describe("Client", func() {
 				dialed := make(chan struct{})
 				go func() {
 					defer GinkgoRecover()
-					err := cl.dial()
+					err := cl.dial(context.Background())
 					Expect(err).ToNot(HaveOccurred())
 					close(dialed)
 				}()
 				Eventually(sessionChan).Should(HaveLen(1))
-				err := cl.handlePacket(nil, wire.ComposeGQUICVersionNegotiation(connID, []protocol.VersionNumber{version2}))
-				Expect(err).ToNot(HaveOccurred())
+				cl.handlePacket(composeVersionNegotiationPacket(connID, []protocol.VersionNumber{version2}))
 				Eventually(sessionChan).Should(BeEmpty())
 			})
 
 			It("only accepts one version negotiation packet", func() {
+				phm := NewMockPacketHandlerManager(mockCtrl)
+				phm.EXPECT().Add(connID, gomock.Any()).Times(2)
+				cl.packetHandlers = phm
 				version1 := protocol.Version39
 				version2 := protocol.Version39 + 1
 				version3 := protocol.Version39 + 2
 				Expect(version2.UsesTLS()).To(BeFalse())
 				Expect(version3.UsesTLS()).To(BeFalse())
-				sess1 := NewMockPacketHandler(mockCtrl)
+				sess1 := NewMockQuicSession(mockCtrl)
 				run1 := make(chan struct{})
 				sess1.EXPECT().run().Do(func() { <-run1 }).Return(errCloseSessionForNewVersion)
-				sess1.EXPECT().Close(errCloseSessionForNewVersion).Do(func(error) { close(run1) })
-				sess2 := NewMockPacketHandler(mockCtrl)
+				sess1.EXPECT().destroy(errCloseSessionForNewVersion).Do(func(error) { close(run1) })
+				sess2 := NewMockQuicSession(mockCtrl)
 				sess2.EXPECT().run()
-				sessionChan := make(chan *MockPacketHandler, 2)
+				sessionChan := make(chan *MockQuicSession, 2)
 				sessionChan <- sess1
 				sessionChan <- sess2
 				newClientSession = func(
@@ -428,119 +793,81 @@ var _ = Describe("Client", func() {
 					_ sessionRunner,
 					_ string,
 					_ protocol.VersionNumber,
-					connectionID protocol.ConnectionID,
+					_ protocol.ConnectionID,
+					_ protocol.ConnectionID,
 					_ *tls.Config,
 					_ *Config,
 					_ protocol.VersionNumber,
 					_ []protocol.VersionNumber,
 					_ utils.Logger,
-				) (packetHandler, error) {
+				) (quicSession, error) {
 					return <-sessionChan, nil
 				}
 
-				cl.config = &Config{Versions: []protocol.VersionNumber{version1, version2}}
+				cl.config = &Config{Versions: []protocol.VersionNumber{version1, version2, version3}}
 				dialed := make(chan struct{})
 				go func() {
 					defer GinkgoRecover()
-					err := cl.dial()
+					err := cl.dial(context.Background())
 					Expect(err).ToNot(HaveOccurred())
 					close(dialed)
 				}()
 				Eventually(sessionChan).Should(HaveLen(1))
-				err := cl.handlePacket(nil, wire.ComposeGQUICVersionNegotiation(connID, []protocol.VersionNumber{version2}))
-				Expect(err).ToNot(HaveOccurred())
+				cl.handlePacket(composeVersionNegotiationPacket(connID, []protocol.VersionNumber{version2}))
 				Eventually(sessionChan).Should(BeEmpty())
-				err = cl.handlePacket(nil, wire.ComposeGQUICVersionNegotiation(connID, []protocol.VersionNumber{version3}))
-				Expect(err).To(MatchError("received a delayed Version Negotiation Packet"))
+				Expect(cl.version).To(Equal(version2))
+				cl.handlePacket(composeVersionNegotiationPacket(connID, []protocol.VersionNumber{version3}))
 				Eventually(dialed).Should(BeClosed())
+				Expect(cl.version).To(Equal(version2))
 			})
 
 			It("errors if no matching version is found", func() {
-				sess := NewMockPacketHandler(mockCtrl)
-				sess.EXPECT().Close(gomock.Any())
+				sess := NewMockQuicSession(mockCtrl)
+				sess.EXPECT().destroy(qerr.InvalidVersion)
 				cl.session = sess
 				cl.config = &Config{Versions: protocol.SupportedVersions}
-				err := cl.handlePacket(nil, wire.ComposeGQUICVersionNegotiation(connID, []protocol.VersionNumber{1}))
-				Expect(err).ToNot(HaveOccurred())
+				cl.handlePacket(composeVersionNegotiationPacket(connID, []protocol.VersionNumber{1}))
 			})
 
 			It("errors if the version is supported by quic-go, but disabled by the quic.Config", func() {
-				sess := NewMockPacketHandler(mockCtrl)
-				sess.EXPECT().Close(gomock.Any())
+				sess := NewMockQuicSession(mockCtrl)
+				sess.EXPECT().destroy(qerr.InvalidVersion)
 				cl.session = sess
 				v := protocol.VersionNumber(1234)
 				Expect(v).ToNot(Equal(cl.version))
 				cl.config = &Config{Versions: protocol.SupportedVersions}
-				err := cl.handlePacket(nil, wire.ComposeGQUICVersionNegotiation(connID, []protocol.VersionNumber{v}))
-				Expect(err).ToNot(HaveOccurred())
+				cl.handlePacket(composeVersionNegotiationPacket(connID, []protocol.VersionNumber{v}))
 			})
 
 			It("changes to the version preferred by the quic.Config", func() {
-				sess := NewMockPacketHandler(mockCtrl)
-				sess.EXPECT().Close(errCloseSessionForNewVersion)
+				phm := NewMockPacketHandlerManager(mockCtrl)
+				cl.packetHandlers = phm
+
+				sess := NewMockQuicSession(mockCtrl)
+				sess.EXPECT().destroy(errCloseSessionForNewVersion)
 				cl.session = sess
-				config := &Config{Versions: []protocol.VersionNumber{1234, 4321}}
-				cl.config = config
-				err := cl.handlePacket(nil, wire.ComposeGQUICVersionNegotiation(connID, []protocol.VersionNumber{4321, 1234}))
-				Expect(err).ToNot(HaveOccurred())
+				versions := []protocol.VersionNumber{1234, 4321}
+				cl.config = &Config{Versions: versions}
+				cl.handlePacket(composeVersionNegotiationPacket(connID, versions))
 				Expect(cl.version).To(Equal(protocol.VersionNumber(1234)))
 			})
 
 			It("drops version negotiation packets that contain the offered version", func() {
+				cl.config = &Config{}
 				ver := cl.version
-				err := cl.handlePacket(nil, wire.ComposeGQUICVersionNegotiation(connID, []protocol.VersionNumber{ver}))
-				Expect(err).ToNot(HaveOccurred())
+				cl.handlePacket(composeVersionNegotiationPacket(connID, []protocol.VersionNumber{ver}))
 				Expect(cl.version).To(Equal(ver))
 			})
 		})
 	})
 
-	It("ignores packets with an invalid public header", func() {
-		cl.session = NewMockPacketHandler(mockCtrl) // don't EXPECT any handlePacket calls
-		err := cl.handlePacket(addr, []byte("invalid packet"))
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("error parsing packet from"))
-	})
-
-	It("errors on packets that are smaller than the Payload Length in the packet header", func() {
-		cl.session = NewMockPacketHandler(mockCtrl) // don't EXPECT any handlePacket calls
-		b := &bytes.Buffer{}
-		hdr := &wire.Header{
-			IsLongHeader:     true,
-			Type:             protocol.PacketTypeHandshake,
-			PayloadLen:       1000,
-			SrcConnectionID:  protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8},
-			DestConnectionID: protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8},
-			PacketNumberLen:  protocol.PacketNumberLen1,
-			Version:          versionIETFFrames,
-		}
-		Expect(hdr.Write(b, protocol.PerspectiveClient, versionIETFFrames)).To(Succeed())
-		cl.handlePacket(addr, append(b.Bytes(), make([]byte, 456)...))
-	})
-
-	It("cuts packets at the payload length", func() {
-		sess := NewMockPacketHandler(mockCtrl)
-		sess.EXPECT().handlePacket(gomock.Any()).Do(func(packet *receivedPacket) {
-			Expect(packet.data).To(HaveLen(123))
-		})
-		cl.session = sess
-		b := &bytes.Buffer{}
-		hdr := &wire.Header{
-			IsLongHeader:     true,
-			Type:             protocol.PacketTypeHandshake,
-			PayloadLen:       123,
-			SrcConnectionID:  connID,
-			DestConnectionID: connID,
-			PacketNumberLen:  protocol.PacketNumberLen1,
-			Version:          versionIETFFrames,
-		}
-		Expect(hdr.Write(b, protocol.PerspectiveClient, versionIETFFrames)).To(Succeed())
-		err := cl.handlePacket(addr, append(b.Bytes(), make([]byte, 456)...))
-		Expect(err).ToNot(HaveOccurred())
+	It("tells its version", func() {
+		Expect(cl.version).ToNot(BeZero())
+		Expect(cl.GetVersion()).To(Equal(cl.version))
 	})
 
 	It("ignores packets with the wrong Long Header Type", func() {
-		b := &bytes.Buffer{}
+		cl.config = &Config{}
 		hdr := &wire.Header{
 			IsLongHeader:     true,
 			Type:             protocol.PacketTypeInitial,
@@ -550,48 +877,55 @@ var _ = Describe("Client", func() {
 			PacketNumberLen:  protocol.PacketNumberLen1,
 			Version:          versionIETFFrames,
 		}
-		Expect(hdr.Write(b, protocol.PerspectiveServer, versionIETFFrames)).To(Succeed())
-		err := cl.handlePacket(addr, append(b.Bytes(), make([]byte, 456)...))
+		err := cl.handlePacketImpl(&receivedPacket{
+			remoteAddr: addr,
+			header:     hdr,
+			data:       make([]byte, 456),
+		})
 		Expect(err).To(MatchError("Received unsupported packet type: Initial"))
 	})
 
 	It("ignores packets without connection id, if it didn't request connection id trunctation", func() {
-		cl.session = NewMockPacketHandler(mockCtrl) // don't EXPECT any handlePacket calls
+		cl.version = versionGQUICFrames
+		cl.session = NewMockQuicSession(mockCtrl) // don't EXPECT any handlePacket calls
 		cl.config = &Config{RequestConnectionIDOmission: false}
-		buf := &bytes.Buffer{}
-		err := (&wire.Header{
-			OmitConnectionID: true,
-			SrcConnectionID:  connID,
-			DestConnectionID: connID,
-			PacketNumber:     1,
-			PacketNumberLen:  protocol.PacketNumberLen1,
-		}).Write(buf, protocol.PerspectiveServer, versionGQUICFrames)
-		Expect(err).ToNot(HaveOccurred())
-		err = cl.handlePacket(addr, buf.Bytes())
+		hdr := &wire.Header{
+			IsPublicHeader:  true,
+			PacketNumber:    1,
+			PacketNumberLen: 1,
+		}
+		err := cl.handlePacketImpl(&receivedPacket{
+			remoteAddr: addr,
+			header:     hdr,
+		})
 		Expect(err).To(MatchError("received packet with truncated connection ID, but didn't request truncation"))
 	})
 
 	It("ignores packets with the wrong destination connection ID", func() {
-		cl.session = NewMockPacketHandler(mockCtrl) // don't EXPECT any handlePacket calls
-		buf := &bytes.Buffer{}
+		cl.session = NewMockQuicSession(mockCtrl) // don't EXPECT any handlePacket calls
 		cl.version = versionIETFFrames
 		cl.config = &Config{RequestConnectionIDOmission: false}
 		connID2 := protocol.ConnectionID{8, 7, 6, 5, 4, 3, 2, 1}
 		Expect(connID).ToNot(Equal(connID2))
-		err := (&wire.Header{
+		hdr := &wire.Header{
 			DestConnectionID: connID2,
 			SrcConnectionID:  connID,
 			PacketNumber:     1,
 			PacketNumberLen:  protocol.PacketNumberLen1,
 			Version:          versionIETFFrames,
-		}).Write(buf, protocol.PerspectiveServer, versionIETFFrames)
-		Expect(err).ToNot(HaveOccurred())
-		err = cl.handlePacket(addr, buf.Bytes())
+		}
+		err := cl.handlePacketImpl(&receivedPacket{
+			remoteAddr: addr,
+			header:     hdr,
+		})
 		Expect(err).To(MatchError(fmt.Sprintf("received a packet with an unexpected connection ID (0x0807060504030201, expected %s)", connID)))
 	})
 
 	It("creates new gQUIC sessions with the right parameters", func() {
-		config := &Config{Versions: protocol.SupportedVersions}
+		manager := NewMockPacketHandlerManager(mockCtrl)
+		manager.EXPECT().Add(gomock.Any(), gomock.Any())
+		mockMultiplexer.EXPECT().AddConn(packetConn, gomock.Any()).Return(manager, nil)
+
 		c := make(chan struct{})
 		var cconn connection
 		var hostname string
@@ -602,23 +936,33 @@ var _ = Describe("Client", func() {
 			_ sessionRunner,
 			hostnameP string,
 			versionP protocol.VersionNumber,
+			connIDP protocol.ConnectionID,
 			_ protocol.ConnectionID,
 			_ *tls.Config,
 			configP *Config,
 			_ protocol.VersionNumber,
 			_ []protocol.VersionNumber,
 			_ utils.Logger,
-		) (packetHandler, error) {
+		) (quicSession, error) {
 			cconn = connP
 			hostname = hostnameP
 			version = versionP
 			conf = configP
+			connID = connIDP
 			close(c)
-			sess := NewMockPacketHandler(mockCtrl)
+			sess := NewMockQuicSession(mockCtrl)
 			sess.EXPECT().run()
 			return sess, nil
 		}
-		_, err := Dial(packetConn, addr, "quic.clemente.io:1337", nil, config)
+
+		config := &Config{Versions: supportedVersionsWithoutGQUIC44}
+		_, err := Dial(
+			packetConn,
+			addr,
+			"quic.clemente.io:1337",
+			nil,
+			config,
+		)
 		Expect(err).ToNot(HaveOccurred())
 		Eventually(c).Should(BeClosed())
 		Expect(cconn.(*conn).pconn).To(Equal(packetConn))
@@ -627,100 +971,59 @@ var _ = Describe("Client", func() {
 		Expect(conf.Versions).To(Equal(config.Versions))
 	})
 
-	It("creates a new session when the server performs a retry", func() {
-		config := &Config{Versions: []protocol.VersionNumber{protocol.VersionTLS}}
-		cl.config = config
-		sess1 := NewMockPacketHandler(mockCtrl)
-		sess1.EXPECT().run().Return(handshake.ErrCloseSessionForRetry)
-		sess2 := NewMockPacketHandler(mockCtrl)
-		sess2.EXPECT().run()
-		sessions := []*MockPacketHandler{sess1, sess2}
-		newTLSClientSession = func(
-			connP connection,
-			_ sessionRunner,
-			hostnameP string,
-			versionP protocol.VersionNumber,
-			_ protocol.ConnectionID,
-			_ protocol.ConnectionID,
-			configP *Config,
-			tls handshake.MintTLS,
-			paramsChan <-chan handshake.TransportParameters,
-			_ protocol.PacketNumber,
-			_ utils.Logger,
-		) (packetHandler, error) {
-			sess := sessions[0]
-			sessions = sessions[1:]
-			return sess, nil
-		}
-		_, err := Dial(packetConn, addr, "quic.clemente.io:1337", nil, config)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(sessions).To(BeEmpty())
-	})
-
-	Context("handling packets", func() {
-		It("handles packets", func() {
-			sess := NewMockPacketHandler(mockCtrl)
-			sess.EXPECT().handlePacket(gomock.Any())
-			cl.session = sess
-			ph := wire.Header{
-				PacketNumber:     1,
-				PacketNumberLen:  protocol.PacketNumberLen2,
-				DestConnectionID: connID,
-				SrcConnectionID:  connID,
-			}
-			b := &bytes.Buffer{}
-			err := ph.Write(b, protocol.PerspectiveServer, cl.version)
-			Expect(err).ToNot(HaveOccurred())
-			packetConn.dataToRead <- b.Bytes()
-
-			done := make(chan struct{})
-			go func() {
-				defer GinkgoRecover()
-				cl.listen()
-				// it should continue listening when receiving valid packets
-				close(done)
-			}()
-
-			Consistently(done).ShouldNot(BeClosed())
-			// make the go routine return
-			sess.EXPECT().Close(gomock.Any())
-			Expect(packetConn.Close()).To(Succeed())
-			Eventually(done).Should(BeClosed())
-		})
-
-		It("closes the session when encountering an error while reading from the connection", func() {
-			testErr := errors.New("test error")
-			sess := NewMockPacketHandler(mockCtrl)
-			sess.EXPECT().Close(testErr)
-			cl.session = sess
-			packetConn.readErr = testErr
-			cl.listen()
-		})
-	})
-
 	Context("Public Reset handling", func() {
+		var (
+			pr     []byte
+			hdr    *wire.Header
+			hdrLen int
+		)
+
+		BeforeEach(func() {
+			cl.config = &Config{}
+
+			pr = wire.WritePublicReset(cl.destConnID, 1, 0)
+			r := bytes.NewReader(pr)
+			iHdr, err := wire.ParseInvariantHeader(r, 0)
+			Expect(err).ToNot(HaveOccurred())
+			hdr, err = iHdr.Parse(r, protocol.PerspectiveServer, versionGQUICFrames)
+			Expect(err).ToNot(HaveOccurred())
+			hdrLen = r.Len()
+		})
+
 		It("closes the session when receiving a Public Reset", func() {
-			sess := NewMockPacketHandler(mockCtrl)
+			cl.version = versionGQUICFrames
+			sess := NewMockQuicSession(mockCtrl)
 			sess.EXPECT().closeRemote(gomock.Any()).Do(func(err error) {
 				Expect(err.(*qerr.QuicError).ErrorCode).To(Equal(qerr.PublicReset))
 			})
 			cl.session = sess
-			err := cl.handlePacket(addr, wire.WritePublicReset(cl.destConnID, 1, 0))
-			Expect(err).ToNot(HaveOccurred())
+			cl.handlePacketImpl(&receivedPacket{
+				remoteAddr: addr,
+				header:     hdr,
+				data:       pr[len(pr)-hdrLen:],
+			})
 		})
 
 		It("ignores Public Resets from the wrong remote address", func() {
-			cl.session = NewMockPacketHandler(mockCtrl) // don't EXPECT any calls
+			cl.version = versionGQUICFrames
+			cl.session = NewMockQuicSession(mockCtrl) // don't EXPECT any calls
 			spoofedAddr := &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 5678}
-			err := cl.handlePacket(spoofedAddr, wire.WritePublicReset(cl.destConnID, 1, 0))
+			err := cl.handlePacketImpl(&receivedPacket{
+				remoteAddr: spoofedAddr,
+				header:     hdr,
+				data:       pr[len(pr)-hdrLen:],
+			})
 			Expect(err).To(MatchError("Received a spoofed Public Reset"))
 		})
 
 		It("ignores unparseable Public Resets", func() {
-			cl.session = NewMockPacketHandler(mockCtrl) // don't EXPECT any calls
-			pr := wire.WritePublicReset(cl.destConnID, 1, 0)
-			err := cl.handlePacket(addr, pr[:len(pr)-5])
-			Expect(err).To(HaveOccurred())
+			cl.version = versionGQUICFrames
+			cl.session = NewMockQuicSession(mockCtrl) // don't EXPECT any calls
+			err := cl.handlePacketImpl(&receivedPacket{
+				remoteAddr: addr,
+				header:     hdr,
+				data:       pr[len(pr)-hdrLen : len(pr)-5], // cut off the last 5 bytes
+			})
 			Expect(err.Error()).To(ContainSubstring("Received a Public Reset. An error occurred parsing the packet"))
 		})
 	})

@@ -14,18 +14,19 @@ import (
 	"github.com/lucas-clemente/quic-go/internal/testdata"
 	"github.com/lucas-clemente/quic-go/internal/utils"
 	"github.com/lucas-clemente/quic-go/internal/wire"
-	"github.com/lucas-clemente/quic-go/qerr"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
 
 type mockSession struct {
-	*MockPacketHandler
+	*MockQuicSession
 
 	connID protocol.ConnectionID
 	runner sessionRunner
 }
+
+func (s *mockSession) GetPerspective() protocol.Perspective { panic("not implemented") }
 
 var _ = Describe("Server", func() {
 	var (
@@ -48,6 +49,8 @@ var _ = Describe("Server", func() {
 				RequestConnectionIDOmission: true,
 				MaxIncomingStreams:          1234,
 				MaxIncomingUniStreams:       4321,
+				ConnectionIDLength:          12,
+				Versions:                    []protocol.VersionNumber{VersionGQUIC43},
 			}
 			c := populateServerConfig(config)
 			Expect(c.HandshakeTimeout).To(Equal(1337 * time.Minute))
@@ -55,6 +58,26 @@ var _ = Describe("Server", func() {
 			Expect(c.RequestConnectionIDOmission).To(BeFalse())
 			Expect(c.MaxIncomingStreams).To(Equal(1234))
 			Expect(c.MaxIncomingUniStreams).To(Equal(4321))
+			Expect(c.ConnectionIDLength).To(Equal(12))
+			Expect(c.Versions).To(Equal([]protocol.VersionNumber{VersionGQUIC43}))
+		})
+
+		It("uses 8 byte connection IDs if gQUIC 44 is supported", func() {
+			config := &Config{
+				Versions:           []protocol.VersionNumber{protocol.Version43, protocol.Version44},
+				ConnectionIDLength: 13,
+			}
+			c := populateServerConfig(config)
+			Expect(c.Versions).To(Equal([]protocol.VersionNumber{protocol.Version43, protocol.Version44}))
+			Expect(c.ConnectionIDLength).To(Equal(8))
+		})
+
+		It("uses 4 byte connection IDs by default, if gQUIC 44 is not supported", func() {
+			config := &Config{
+				Versions: []protocol.VersionNumber{protocol.Version39},
+			}
+			c := populateServerConfig(config)
+			Expect(c.ConnectionIDLength).To(Equal(protocol.DefaultConnectionIDLength))
 		})
 
 		It("disables bidirectional streams", func() {
@@ -81,26 +104,27 @@ var _ = Describe("Server", func() {
 	Context("with mock session", func() {
 		var (
 			serv           *server
-			firstPacket    []byte // a valid first packet for a new connection with connectionID 0x4cfa9f9b668619f6 (= connID)
+			firstPacket    *receivedPacket
 			connID         = protocol.ConnectionID{0x4c, 0xfa, 0x9f, 0x9b, 0x66, 0x86, 0x19, 0xf6}
-			sessions       = make([]*MockPacketHandler, 0)
-			sessionHandler *MockSessionHandler
+			sessions       = make([]*MockQuicSession, 0)
+			sessionHandler *MockPacketHandlerManager
 		)
 
 		BeforeEach(func() {
-			sessionHandler = NewMockSessionHandler(mockCtrl)
+			sessionHandler = NewMockPacketHandlerManager(mockCtrl)
 			newMockSession := func(
 				_ connection,
 				runner sessionRunner,
 				_ protocol.VersionNumber,
 				connID protocol.ConnectionID,
+				_ protocol.ConnectionID,
 				_ *handshake.ServerConfig,
 				_ *tls.Config,
 				_ *Config,
 				_ utils.Logger,
-			) (packetHandler, error) {
+			) (quicSession, error) {
 				ExpectWithOffset(0, sessions).ToNot(BeEmpty())
-				s := &mockSession{MockPacketHandler: sessions[0]}
+				s := &mockSession{MockQuicSession: sessions[0]}
 				s.connID = connID
 				s.runner = runner
 				sessions = sessions[1:]
@@ -118,9 +142,16 @@ var _ = Describe("Server", func() {
 			serv.setup()
 			b := &bytes.Buffer{}
 			utils.BigEndian.WriteUint32(b, uint32(protocol.SupportedVersions[0]))
-			firstPacket = []byte{0x09, 0x4c, 0xfa, 0x9f, 0x9b, 0x66, 0x86, 0x19, 0xf6}
-			firstPacket = append(append(firstPacket, b.Bytes()...), 0x01)
-			firstPacket = append(firstPacket, bytes.Repeat([]byte{0}, protocol.MinClientHelloSize)...) // add padding
+			firstPacket = &receivedPacket{
+				header: &wire.Header{
+					VersionFlag:      true,
+					Version:          serv.config.Versions[0],
+					DestConnectionID: protocol.ConnectionID{0x4c, 0xfa, 0x9f, 0x9b, 0x66, 0x86, 0x19, 0xf6},
+					PacketNumber:     1,
+				},
+				data:    bytes.Repeat([]byte{0}, protocol.MinClientHelloSize),
+				rcvTime: time.Now(),
+			}
 		})
 
 		AfterEach(func() {
@@ -136,38 +167,38 @@ var _ = Describe("Server", func() {
 		})
 
 		It("creates new sessions", func() {
-			s := NewMockPacketHandler(mockCtrl)
+			s := NewMockQuicSession(mockCtrl)
 			s.EXPECT().handlePacket(gomock.Any())
 			run := make(chan struct{})
 			s.EXPECT().run().Do(func() { close(run) })
 			sessions = append(sessions, s)
 
-			sessionHandler.EXPECT().Get(connID)
-			sessionHandler.EXPECT().Add(connID, gomock.Any()).Do(func(_ protocol.ConnectionID, sess packetHandler) {
-				Expect(sess.(*mockSession).connID).To(Equal(connID))
+			sessionHandler.EXPECT().Add(connID, gomock.Any()).Do(func(cid protocol.ConnectionID, _ packetHandler) {
+				Expect(cid).To(Equal(connID))
 			})
-			err := serv.handlePacket(nil, firstPacket)
-			Expect(err).ToNot(HaveOccurred())
+			Expect(serv.handlePacketImpl(firstPacket)).To(Succeed())
 			Eventually(run).Should(BeClosed())
 		})
 
 		It("accepts new TLS sessions", func() {
 			connID := protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8}
-			run := make(chan struct{})
-			sess := NewMockPacketHandler(mockCtrl)
-			sess.EXPECT().run().Do(func() { close(run) })
+			sess := NewMockQuicSession(mockCtrl)
 			err := serv.setupTLS()
 			Expect(err).ToNot(HaveOccurred())
-			sessionHandler.EXPECT().Add(connID, sess)
+			added := make(chan struct{})
+			sessionHandler.EXPECT().Add(connID, gomock.Any()).Do(func(_ protocol.ConnectionID, ph packetHandler) {
+				Expect(ph.GetPerspective()).To(Equal(protocol.PerspectiveServer))
+				close(added)
+			})
 			serv.serverTLS.sessionChan <- tlsSession{
 				connID: connID,
 				sess:   sess,
 			}
-			Eventually(run).Should(BeClosed())
+			Eventually(added).Should(BeClosed())
 		})
 
 		It("accepts a session once the connection it is forward secure", func() {
-			s := NewMockPacketHandler(mockCtrl)
+			s := NewMockQuicSession(mockCtrl)
 			s.EXPECT().handlePacket(gomock.Any())
 			run := make(chan struct{})
 			s.EXPECT().run().Do(func() { close(run) })
@@ -175,17 +206,15 @@ var _ = Describe("Server", func() {
 			done := make(chan struct{})
 			go func() {
 				defer GinkgoRecover()
-				sess, err := serv.Accept()
+				_, err := serv.Accept()
 				Expect(err).ToNot(HaveOccurred())
-				Expect(sess.(*mockSession).connID).To(Equal(connID))
 				close(done)
 			}()
-			sessionHandler.EXPECT().Get(connID)
 			sessionHandler.EXPECT().Add(connID, gomock.Any()).Do(func(_ protocol.ConnectionID, sess packetHandler) {
 				Consistently(done).ShouldNot(BeClosed())
-				sess.(*mockSession).runner.onHandshakeComplete(sess)
+				sess.(*serverSession).quicSession.(*mockSession).runner.onHandshakeComplete(sess.(Session))
 			})
-			err := serv.handlePacket(nil, firstPacket)
+			err := serv.handlePacketImpl(firstPacket)
 			Expect(err).ToNot(HaveOccurred())
 			Eventually(done).Should(BeClosed())
 			Eventually(run).Should(BeClosed())
@@ -193,7 +222,7 @@ var _ = Describe("Server", func() {
 
 		It("doesn't accept sessions that error during the handshake", func() {
 			run := make(chan error, 1)
-			sess := NewMockPacketHandler(mockCtrl)
+			sess := NewMockQuicSession(mockCtrl)
 			sess.EXPECT().handlePacket(gomock.Any())
 			sess.EXPECT().run().DoAndReturn(func() error { return <-run })
 			sessions = append(sessions, sess)
@@ -203,44 +232,26 @@ var _ = Describe("Server", func() {
 				serv.Accept()
 				close(done)
 			}()
-			sessionHandler.EXPECT().Get(connID)
-			sessionHandler.EXPECT().Add(connID, gomock.Any()).Do(func(_ protocol.ConnectionID, sess packetHandler) {
+			sessionHandler.EXPECT().Add(connID, gomock.Any()).Do(func(protocol.ConnectionID, packetHandler) {
 				run <- errors.New("handshake error")
 			})
-			err := serv.handlePacket(nil, firstPacket)
-			Expect(err).ToNot(HaveOccurred())
+			Expect(serv.handlePacketImpl(firstPacket)).To(Succeed())
 			Consistently(done).ShouldNot(BeClosed())
+
 			// make the go routine return
-			sessionHandler.EXPECT().Close()
 			close(serv.errorChan)
-			serv.Close()
 			Eventually(done).Should(BeClosed())
 		})
 
-		It("assigns packets to existing sessions", func() {
-			sess := NewMockPacketHandler(mockCtrl)
-			sess.EXPECT().handlePacket(gomock.Any())
-
-			sessionHandler.EXPECT().Get(connID).Return(sess, true)
-			err := serv.handlePacket(nil, []byte{0x08, 0x4c, 0xfa, 0x9f, 0x9b, 0x66, 0x86, 0x19, 0xf6, 0x01})
-			Expect(err).ToNot(HaveOccurred())
-		})
-
-		It("closes the sessionHandler and the connection when Close is called", func() {
-			go func() {
-				defer GinkgoRecover()
-				serv.serve()
-			}()
-			// close the server
-			sessionHandler.EXPECT().Close().AnyTimes()
+		It("closes the sessionHandler when Close is called", func() {
+			sessionHandler.EXPECT().CloseServer()
 			Expect(serv.Close()).To(Succeed())
-			Expect(conn.closed).To(BeTrue())
 		})
 
-		It("ignores packets for closed sessions", func() {
-			sessionHandler.EXPECT().Get(connID).Return(nil, true)
-			err := serv.handlePacket(nil, firstPacket)
-			Expect(err).ToNot(HaveOccurred())
+		It("closes twice", func() {
+			sessionHandler.EXPECT().CloseServer()
+			Expect(serv.Close()).To(Succeed())
+			Expect(serv.Close()).To(Succeed())
 		})
 
 		It("works if no quic.Config is given", func(done Done) {
@@ -254,151 +265,144 @@ var _ = Describe("Server", func() {
 			ln, err := ListenAddr("127.0.0.1:0", testdata.GetTLSConfig(), config)
 			Expect(err).ToNot(HaveOccurred())
 
-			var returned bool
-			go func() {
-				defer GinkgoRecover()
-				_, err := ln.Accept()
-				Expect(err).To(HaveOccurred())
-				Expect(err.Error()).To(ContainSubstring("use of closed network connection"))
-				returned = true
-			}()
-			ln.Close()
-			Eventually(func() bool { return returned }).Should(BeTrue())
-		})
-
-		It("errors when encountering a connection error", func() {
-			testErr := errors.New("connection error")
-			conn.readErr = testErr
-			sessionHandler.EXPECT().Close()
 			done := make(chan struct{})
 			go func() {
 				defer GinkgoRecover()
-				serv.serve()
+				ln.Accept()
 				close(done)
 			}()
-			_, err := serv.Accept()
-			Expect(err).To(MatchError(testErr))
+			ln.Close()
 			Eventually(done).Should(BeClosed())
 		})
 
-		It("ignores delayed packets with mismatching versions", func() {
-			sess := NewMockPacketHandler(mockCtrl)
-			// don't EXPECT any handlePacket() calls to this session
-			sessionHandler.EXPECT().Get(connID).Return(sess, true)
-
-			b := &bytes.Buffer{}
-			// add an unsupported version
-			data := []byte{0x09, 0x4c, 0xfa, 0x9f, 0x9b, 0x66, 0x86, 0x19, 0xf6}
-			utils.BigEndian.WriteUint32(b, uint32(protocol.SupportedVersions[0]+1))
-			data = append(append(data, b.Bytes()...), 0x01)
-			err := serv.handlePacket(nil, data)
+		It("closes the connection when it was created with ListenAddr", func() {
+			addr, err := net.ResolveUDPAddr("udp", "localhost:12345")
 			Expect(err).ToNot(HaveOccurred())
-			// if we didn't ignore the packet, the server would try to send a version negotiation packet, which would make the test panic because it doesn't have a udpConn
-			Expect(conn.dataWritten.Bytes()).To(BeEmpty())
-		})
 
-		It("errors on invalid public header", func() {
-			err := serv.handlePacket(nil, nil)
-			Expect(err.(*qerr.QuicError).ErrorCode).To(Equal(qerr.InvalidPacketHeader))
-		})
-
-		It("errors on packets that are smaller than the Payload Length in the packet header", func() {
-			serv.supportsTLS = true
-			b := &bytes.Buffer{}
-			hdr := &wire.Header{
-				IsLongHeader:     true,
-				Type:             protocol.PacketTypeHandshake,
-				PayloadLen:       1000,
-				SrcConnectionID:  protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8},
-				DestConnectionID: protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8},
-				PacketNumberLen:  protocol.PacketNumberLen1,
-				Version:          versionIETFFrames,
-			}
-			Expect(hdr.Write(b, protocol.PerspectiveClient, versionIETFFrames)).To(Succeed())
-			err := serv.handlePacket(nil, append(b.Bytes(), make([]byte, 456)...))
-			Expect(err).To(MatchError("packet payload (456 bytes) is smaller than the expected payload length (1000 bytes)"))
-		})
-
-		It("cuts packets at the payload length", func() {
-			sess := NewMockPacketHandler(mockCtrl)
-			sess.EXPECT().handlePacket(gomock.Any()).Do(func(packet *receivedPacket) {
-				Expect(packet.data).To(HaveLen(123))
-			})
-
-			serv.supportsTLS = true
-			b := &bytes.Buffer{}
-			hdr := &wire.Header{
-				IsLongHeader:     true,
-				Type:             protocol.PacketTypeHandshake,
-				PayloadLen:       123,
-				SrcConnectionID:  connID,
-				DestConnectionID: connID,
-				PacketNumberLen:  protocol.PacketNumberLen1,
-				Version:          versionIETFFrames,
-			}
-			Expect(hdr.Write(b, protocol.PerspectiveClient, versionIETFFrames)).To(Succeed())
-			sessionHandler.EXPECT().Get(connID).Return(sess, true)
-			err := serv.handlePacket(nil, append(b.Bytes(), make([]byte, 456)...))
+			serv, err := ListenAddr("localhost:0", nil, nil)
 			Expect(err).ToNot(HaveOccurred())
-		})
-
-		It("drops packets with invalid packet types", func() {
-			serv.supportsTLS = true
-			b := &bytes.Buffer{}
-			hdr := &wire.Header{
-				IsLongHeader:     true,
-				Type:             protocol.PacketTypeRetry,
-				PayloadLen:       123,
-				SrcConnectionID:  connID,
-				DestConnectionID: connID,
-				PacketNumberLen:  protocol.PacketNumberLen1,
-				Version:          versionIETFFrames,
-			}
-			Expect(hdr.Write(b, protocol.PerspectiveClient, versionIETFFrames)).To(Succeed())
-			err := serv.handlePacket(nil, append(b.Bytes(), make([]byte, 456)...))
-			Expect(err).To(MatchError("Received unsupported packet type: Retry"))
-		})
-
-		It("ignores Public Resets", func() {
-			err := serv.handlePacket(nil, wire.WritePublicReset(connID, 1, 1337))
+			// test that we can write on the packet conn
+			_, err = serv.(*server).conn.WriteTo([]byte("foobar"), addr)
 			Expect(err).ToNot(HaveOccurred())
+			Expect(serv.Close()).To(Succeed())
+			// test that we can't write any more on the packet conn
+			_, err = serv.(*server).conn.WriteTo([]byte("foobar"), addr)
+			Expect(err.Error()).To(ContainSubstring("use of closed network connection"))
+		})
+
+		It("returns Accept when it is closed", func() {
+			done := make(chan struct{})
+			go func() {
+				defer GinkgoRecover()
+				_, err := serv.Accept()
+				Expect(err).To(MatchError("server closed"))
+				close(done)
+			}()
+			sessionHandler.EXPECT().CloseServer()
+			Expect(serv.Close()).To(Succeed())
+			Eventually(done).Should(BeClosed())
+		})
+
+		It("returns Accept with the right error when closeWithError is called", func() {
+			testErr := errors.New("connection error")
+			done := make(chan struct{})
+			go func() {
+				defer GinkgoRecover()
+				_, err := serv.Accept()
+				Expect(err).To(MatchError(testErr))
+				close(done)
+			}()
+			sessionHandler.EXPECT().CloseServer()
+			serv.closeWithError(testErr)
+			Eventually(done).Should(BeClosed())
 		})
 
 		It("doesn't try to process a packet after sending a gQUIC Version Negotiation Packet", func() {
 			config.Versions = []protocol.VersionNumber{99}
-			b := &bytes.Buffer{}
-			hdr := wire.Header{
-				VersionFlag:      true,
-				DestConnectionID: connID,
-				SrcConnectionID:  connID,
-				PacketNumber:     1,
-				PacketNumberLen:  protocol.PacketNumberLen2,
+			p := &receivedPacket{
+				header: &wire.Header{
+					VersionFlag:      true,
+					DestConnectionID: connID,
+					PacketNumber:     1,
+					PacketNumberLen:  protocol.PacketNumberLen2,
+				},
+				data: make([]byte, protocol.MinClientHelloSize),
 			}
-			hdr.Write(b, protocol.PerspectiveClient, 13 /* not a valid QUIC version */)
-			b.Write(bytes.Repeat([]byte{0}, protocol.MinClientHelloSize)) // add a fake CHLO
-			serv.conn = conn
-			sessionHandler.EXPECT().Get(connID)
-			err := serv.handlePacket(nil, b.Bytes())
+			Expect(serv.handlePacketImpl(p)).To(Succeed())
 			Expect(conn.dataWritten.Bytes()).ToNot(BeEmpty())
-			Expect(err).ToNot(HaveOccurred())
 		})
 
-		It("doesn't respond with a version negotiation packet if the first packet is too small", func() {
-			b := &bytes.Buffer{}
-			hdr := wire.Header{
-				VersionFlag:      true,
-				DestConnectionID: connID,
-				SrcConnectionID:  connID,
-				PacketNumber:     1,
-				PacketNumberLen:  protocol.PacketNumberLen2,
-			}
-			hdr.Write(b, protocol.PerspectiveClient, 13 /* not a valid QUIC version */)
-			b.Write(bytes.Repeat([]byte{0}, protocol.MinClientHelloSize-1)) // this packet is 1 byte too small
-			serv.conn = conn
-			sessionHandler.EXPECT().Get(connID)
-			err := serv.handlePacket(udpAddr, b.Bytes())
-			Expect(err).To(MatchError("dropping small packet with unknown version"))
-			Expect(conn.dataWritten.Len()).Should(BeZero())
+		It("sends a PUBLIC_RESET for new connections that don't have the VersionFlag set", func() {
+			err := serv.handlePacketImpl(&receivedPacket{
+				remoteAddr: udpAddr,
+				header: &wire.Header{
+					IsPublicHeader: true,
+					Version:        versionGQUICFrames,
+				},
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(conn.dataWritten.Len()).ToNot(BeZero())
+			Expect(conn.dataWrittenTo).To(Equal(udpAddr))
+			Expect(conn.dataWritten.Bytes()[0] & 0x02).ToNot(BeZero()) // check that the ResetFlag is set
+		})
+
+		It("sends a gQUIC Version Negotaion Packet, if the client sent a gQUIC Public Header", func() {
+			connID := protocol.ConnectionID{8, 7, 6, 5, 4, 3, 2, 1}
+			err := serv.handlePacketImpl(&receivedPacket{
+				remoteAddr: udpAddr,
+				header: &wire.Header{
+					IsPublicHeader:   true,
+					VersionFlag:      true,
+					DestConnectionID: connID,
+					PacketNumber:     1,
+					PacketNumberLen:  protocol.PacketNumberLen2,
+					Version:          protocol.Version39 - 1,
+				},
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(conn.dataWritten.Len()).ToNot(BeZero())
+			Expect(conn.dataWrittenTo).To(Equal(udpAddr))
+			r := bytes.NewReader(conn.dataWritten.Bytes())
+			iHdr, err := wire.ParseInvariantHeader(r, 0)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(iHdr.IsLongHeader).To(BeFalse())
+			replyHdr, err := iHdr.Parse(r, protocol.PerspectiveServer, versionIETFFrames)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(replyHdr.IsVersionNegotiation).To(BeTrue())
+			Expect(replyHdr.DestConnectionID).To(Equal(connID))
+			Expect(r.Len()).To(BeZero())
+		})
+
+		It("sends an IETF draft style Version Negotaion Packet, if the client sent a IETF draft style header", func() {
+			connID := protocol.ConnectionID{8, 7, 6, 5, 4, 3, 2, 1}
+			err := serv.handlePacketImpl(&receivedPacket{
+				remoteAddr: udpAddr,
+				header: &wire.Header{
+					Type:             protocol.PacketTypeInitial,
+					IsLongHeader:     true,
+					DestConnectionID: connID,
+					SrcConnectionID:  connID,
+					PacketNumber:     0x55,
+					PacketNumberLen:  protocol.PacketNumberLen1,
+					Version:          0x1234,
+					PayloadLen:       protocol.MinInitialPacketSize,
+				},
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(conn.dataWritten.Len()).ToNot(BeZero())
+			Expect(conn.dataWrittenTo).To(Equal(udpAddr))
+			r := bytes.NewReader(conn.dataWritten.Bytes())
+			iHdr, err := wire.ParseInvariantHeader(r, 0)
+			Expect(err).ToNot(HaveOccurred())
+			replyHdr, err := iHdr.Parse(r, protocol.PerspectiveServer, versionIETFFrames)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(replyHdr.IsVersionNegotiation).To(BeTrue())
+			Expect(replyHdr.DestConnectionID).To(Equal(connID))
+			Expect(replyHdr.SrcConnectionID).To(Equal(connID))
+			Expect(r.Len()).To(BeZero())
 		})
 	})
 
@@ -459,150 +463,6 @@ var _ = Describe("Server", func() {
 		addr := "1.1.1.1:1111"
 		_, err := ListenAddr(addr, nil, config)
 		Expect(err).To(BeAssignableToTypeOf(&net.OpError{}))
-	})
-
-	It("sends a gQUIC Version Negotaion Packet, if the client sent a gQUIC Public Header", func() {
-		connID := protocol.ConnectionID{8, 7, 6, 5, 4, 3, 2, 1}
-		b := &bytes.Buffer{}
-		hdr := wire.Header{
-			VersionFlag:      true,
-			DestConnectionID: connID,
-			SrcConnectionID:  connID,
-			PacketNumber:     1,
-			PacketNumberLen:  protocol.PacketNumberLen2,
-		}
-		hdr.Write(b, protocol.PerspectiveClient, 13 /* not a valid QUIC version */)
-		b.Write(bytes.Repeat([]byte{0}, protocol.MinClientHelloSize)) // add a fake CHLO
-		conn.dataToRead <- b.Bytes()
-		conn.dataReadFrom = udpAddr
-		ln, err := Listen(conn, nil, config)
-		Expect(err).ToNot(HaveOccurred())
-
-		done := make(chan struct{})
-		go func() {
-			defer GinkgoRecover()
-			ln.Accept()
-			close(done)
-		}()
-
-		Eventually(func() int { return conn.dataWritten.Len() }).ShouldNot(BeZero())
-		Expect(conn.dataWrittenTo).To(Equal(udpAddr))
-		r := bytes.NewReader(conn.dataWritten.Bytes())
-		packet, err := wire.ParseHeaderSentByServer(r)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(packet.VersionFlag).To(BeTrue())
-		Expect(packet.DestConnectionID).To(Equal(connID))
-		Expect(packet.SrcConnectionID).To(Equal(connID))
-		Expect(r.Len()).To(BeZero())
-		Consistently(done).ShouldNot(BeClosed())
-		// make the go routine return
-		ln.Close()
-		Eventually(done).Should(BeClosed())
-	})
-
-	It("sends an IETF draft style Version Negotaion Packet, if the client sent a IETF draft style header", func() {
-		connID := protocol.ConnectionID{8, 7, 6, 5, 4, 3, 2, 1}
-		config.Versions = append(config.Versions, protocol.VersionTLS)
-		b := &bytes.Buffer{}
-		hdr := wire.Header{
-			Type:             protocol.PacketTypeInitial,
-			IsLongHeader:     true,
-			DestConnectionID: connID,
-			SrcConnectionID:  connID,
-			PacketNumber:     0x55,
-			PacketNumberLen:  protocol.PacketNumberLen1,
-			Version:          0x1234,
-			PayloadLen:       protocol.MinInitialPacketSize,
-		}
-		err := hdr.Write(b, protocol.PerspectiveClient, protocol.VersionTLS)
-		Expect(err).ToNot(HaveOccurred())
-		b.Write(bytes.Repeat([]byte{0}, protocol.MinInitialPacketSize)) // add a fake CHLO
-		conn.dataToRead <- b.Bytes()
-		conn.dataReadFrom = udpAddr
-		ln, err := Listen(conn, testdata.GetTLSConfig(), config)
-		Expect(err).ToNot(HaveOccurred())
-
-		done := make(chan struct{})
-		go func() {
-			defer GinkgoRecover()
-			ln.Accept()
-			close(done)
-		}()
-
-		Eventually(func() int { return conn.dataWritten.Len() }).ShouldNot(BeZero())
-		Expect(conn.dataWrittenTo).To(Equal(udpAddr))
-		r := bytes.NewReader(conn.dataWritten.Bytes())
-		packet, err := wire.ParseHeaderSentByServer(r)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(packet.IsVersionNegotiation).To(BeTrue())
-		Expect(packet.DestConnectionID).To(Equal(connID))
-		Expect(packet.SrcConnectionID).To(Equal(connID))
-		Expect(r.Len()).To(BeZero())
-		Consistently(done).ShouldNot(BeClosed())
-		// make the go routine return
-		ln.Close()
-		Eventually(done).Should(BeClosed())
-	})
-
-	It("ignores IETF draft style Initial packets, if it doesn't support TLS", func() {
-		connID := protocol.ConnectionID{8, 7, 6, 5, 4, 3, 2, 1}
-		b := &bytes.Buffer{}
-		hdr := wire.Header{
-			Type:             protocol.PacketTypeInitial,
-			IsLongHeader:     true,
-			DestConnectionID: connID,
-			SrcConnectionID:  connID,
-			PacketNumber:     0x55,
-			PacketNumberLen:  protocol.PacketNumberLen1,
-			Version:          protocol.VersionTLS,
-		}
-		err := hdr.Write(b, protocol.PerspectiveClient, protocol.VersionTLS)
-		Expect(err).ToNot(HaveOccurred())
-		b.Write(bytes.Repeat([]byte{0}, protocol.MinClientHelloSize)) // add a fake CHLO
-		conn.dataToRead <- b.Bytes()
-		conn.dataReadFrom = udpAddr
-		ln, err := Listen(conn, testdata.GetTLSConfig(), config)
-		Expect(err).ToNot(HaveOccurred())
-		defer ln.Close()
-		Consistently(func() int { return conn.dataWritten.Len() }).Should(BeZero())
-	})
-
-	It("ignores non-Initial Long Header packets for unknown connections", func() {
-		connID := protocol.ConnectionID{8, 7, 6, 5, 4, 3, 2, 1}
-		b := &bytes.Buffer{}
-		hdr := wire.Header{
-			Type:             protocol.PacketTypeHandshake,
-			IsLongHeader:     true,
-			DestConnectionID: connID,
-			SrcConnectionID:  connID,
-			PacketNumber:     0x55,
-			PacketNumberLen:  protocol.PacketNumberLen1,
-			Version:          protocol.VersionTLS,
-		}
-		err := hdr.Write(b, protocol.PerspectiveClient, protocol.VersionTLS)
-		Expect(err).ToNot(HaveOccurred())
-		conn.dataToRead <- b.Bytes()
-		conn.dataReadFrom = udpAddr
-		ln, err := Listen(conn, testdata.GetTLSConfig(), config)
-		Expect(err).ToNot(HaveOccurred())
-		defer ln.Close()
-		Consistently(func() int { return conn.dataWritten.Len() }).Should(BeZero())
-	})
-
-	It("sends a PublicReset for new connections that don't have the VersionFlag set", func() {
-		conn.dataReadFrom = udpAddr
-		conn.dataToRead <- []byte{0x08, 0x4c, 0xfa, 0x9f, 0x9b, 0x66, 0x86, 0x19, 0xf6, 0x01}
-		ln, err := Listen(conn, nil, config)
-		Expect(err).ToNot(HaveOccurred())
-		go func() {
-			defer GinkgoRecover()
-			_, err := ln.Accept()
-			Expect(err).ToNot(HaveOccurred())
-		}()
-
-		Eventually(func() int { return conn.dataWritten.Len() }).ShouldNot(BeZero())
-		Expect(conn.dataWrittenTo).To(Equal(udpAddr))
-		Expect(conn.dataWritten.Bytes()[0] & 0x02).ToNot(BeZero()) // check that the ResetFlag is set
 	})
 })
 

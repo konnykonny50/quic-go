@@ -8,8 +8,6 @@ import (
 	"net"
 	"time"
 
-	"github.com/bifurcation/mint"
-
 	"github.com/lucas-clemente/quic-go/internal/crypto"
 	"github.com/lucas-clemente/quic-go/internal/mocks/crypto"
 	"github.com/lucas-clemente/quic-go/internal/protocol"
@@ -99,7 +97,7 @@ type mockCookieProtector struct {
 	decodeErr error
 }
 
-var _ mint.CookieProtector = &mockCookieProtector{}
+var _ cookieProtector = &mockCookieProtector{}
 
 func (mockCookieProtector) NewToken(sourceAddr []byte) ([]byte, error) {
 	return append([]byte("token "), sourceAddr...), nil
@@ -209,17 +207,6 @@ var _ = Describe("Server Crypto Setup", func() {
 				TagPUBS: bytes.Repeat([]byte{'e'}, 31),
 				TagVER:  versionTag,
 			}
-		})
-
-		It("doesn't support Chrome's head-of-line blocking experiment", func() {
-			HandshakeMessage{
-				Tag: TagCHLO,
-				Data: map[Tag][]byte{
-					TagFHL2: []byte("foobar"),
-				},
-			}.Write(&stream.dataToRead)
-			err := cs.HandleCryptoStream()
-			Expect(err).To(MatchError(ErrHOLExperiment))
 		})
 
 		It("doesn't support Chrome's no STOP_WAITING experiment", func() {

@@ -134,6 +134,23 @@ var _ = Describe("Frame parsing", func() {
 			Expect(frame.(*StopWaitingFrame).LeastUnacked).To(Equal(protocol.PacketNumber(0x1337)))
 		})
 
+		It("errors on STOP_WAITING frames in QUIC 44", func() {
+			Expect(protocol.Version44.UsesStopWaitingFrames()).To(BeFalse())
+			hdr := &Header{
+				PacketNumber:    0x1338,
+				PacketNumberLen: protocol.PacketNumberLen4,
+			}
+			f := &StopWaitingFrame{
+				LeastUnacked:    0x1337,
+				PacketNumber:    hdr.PacketNumber,
+				PacketNumberLen: hdr.PacketNumberLen,
+			}
+			err := f.Write(buf, versionBigEndian)
+			Expect(err).ToNot(HaveOccurred())
+			_, err = ParseNextFrame(bytes.NewReader(buf.Bytes()), hdr, protocol.Version44)
+			Expect(err).To(MatchError("STOP_WAITING frames not supported by this QUIC version"))
+		})
+
 		It("unpacks PING frames", func() {
 			f := &PingFrame{}
 			err := f.Write(buf, versionBigEndian)
@@ -331,6 +348,7 @@ var _ = Describe("Frame parsing", func() {
 				0x0e: qerr.InvalidFrameData,
 				0x0f: qerr.InvalidFrameData,
 				0x10: qerr.InvalidStreamData,
+				0x1a: qerr.InvalidAckData,
 			} {
 				_, err := ParseNextFrame(bytes.NewReader([]byte{b}), nil, versionIETFFrames)
 				Expect(err).To(HaveOccurred())

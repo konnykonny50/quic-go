@@ -27,7 +27,6 @@ var _ = Describe("QUIC Proxy", func() {
 			PacketNumberLen:  protocol.PacketNumberLen6,
 			DestConnectionID: protocol.ConnectionID{0xde, 0xad, 0xbe, 0xef, 0, 0, 0x13, 0x37},
 			SrcConnectionID:  protocol.ConnectionID{0xde, 0xad, 0xbe, 0xef, 0, 0, 0x13, 0x37},
-			OmitConnectionID: false,
 		}
 		hdr.Write(b, protocol.PerspectiveServer, protocol.VersionWhatever)
 		raw := b.Bytes()
@@ -192,7 +191,7 @@ var _ = Describe("QUIC Proxy", func() {
 				Eventually(getClientDict).Should(HaveLen(1))
 				var conn *connection
 				for _, conn = range getClientDict() {
-					Expect(atomic.LoadUint64(&conn.incomingPacketCounter)).To(Equal(uint64(1)))
+					Eventually(func() uint64 { return atomic.LoadUint64(&conn.incomingPacketCounter) }).Should(Equal(uint64(1)))
 				}
 
 				// send the second packet

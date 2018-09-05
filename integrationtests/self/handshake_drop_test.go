@@ -61,7 +61,7 @@ var _ = Describe("Handshake drop tests", func() {
 				defer GinkgoRecover()
 				sess, err := ln.Accept()
 				Expect(err).ToNot(HaveOccurred())
-				defer sess.Close(nil)
+				defer sess.Close()
 				str, err := sess.AcceptStream()
 				Expect(err).ToNot(HaveOccurred())
 				b := make([]byte, 6)
@@ -83,8 +83,8 @@ var _ = Describe("Handshake drop tests", func() {
 
 			var serverSession quic.Session
 			Eventually(serverSessionChan, 10*time.Second).Should(Receive(&serverSession))
-			sess.Close(nil)
-			serverSession.Close(nil)
+			sess.Close()
+			serverSession.Close()
 		},
 	}
 
@@ -117,8 +117,8 @@ var _ = Describe("Handshake drop tests", func() {
 
 			var serverSession quic.Session
 			Eventually(serverSessionChan, 10*time.Second).Should(Receive(&serverSession))
-			sess.Close(nil)
-			serverSession.Close(nil)
+			sess.Close()
+			serverSession.Close()
 		},
 	}
 
@@ -141,8 +141,8 @@ var _ = Describe("Handshake drop tests", func() {
 			var serverSession quic.Session
 			Eventually(serverSessionChan, 10*time.Second).Should(Receive(&serverSession))
 			// both server and client accepted a session. Close now.
-			sess.Close(nil)
-			serverSession.Close(nil)
+			sess.Close()
+			serverSession.Close()
 		},
 	}
 
@@ -175,9 +175,9 @@ var _ = Describe("Handshake drop tests", func() {
 							app.run(version)
 						})
 
-						It(fmt.Sprintf("establishes a connection when 1/4 of the packets are lost in %s direction", d), func() {
+						It(fmt.Sprintf("establishes a connection when 1/5 of the packets are lost in %s direction", d), func() {
 							startListenerAndProxy(func(d quicproxy.Direction, p uint64) bool {
-								return d.Is(direction) && stochasticDropper(4)
+								return d.Is(direction) && stochasticDropper(5)
 							}, version)
 							app.run(version)
 						})

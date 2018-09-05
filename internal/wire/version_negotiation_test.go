@@ -13,11 +13,14 @@ var _ = Describe("Version Negotiation Packets", func() {
 		connID := protocol.ConnectionID{0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0x13, 0x37}
 		versions := []protocol.VersionNumber{1001, 1003}
 		data := ComposeGQUICVersionNegotiation(connID, versions)
-		hdr, err := parsePublicHeader(bytes.NewReader(data), protocol.PerspectiveServer)
+		b := bytes.NewReader(data)
+		iHdr, err := ParseInvariantHeader(b, 4)
+		Expect(err).ToNot(HaveOccurred())
+		hdr, err := iHdr.Parse(b, protocol.PerspectiveServer, versionPublicHeader)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(hdr.VersionFlag).To(BeTrue())
 		Expect(hdr.DestConnectionID).To(Equal(connID))
-		Expect(hdr.SrcConnectionID).To(Equal(connID))
+		Expect(hdr.SrcConnectionID).To(BeEmpty())
 		Expect(hdr.SupportedVersions).To(Equal(versions))
 	})
 
@@ -28,7 +31,10 @@ var _ = Describe("Version Negotiation Packets", func() {
 		data, err := ComposeVersionNegotiation(destConnID, srcConnID, versions)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(data[0] & 0x80).ToNot(BeZero())
-		hdr, err := parseHeader(bytes.NewReader(data))
+		b := bytes.NewReader(data)
+		iHdr, err := ParseInvariantHeader(b, 4)
+		Expect(err).ToNot(HaveOccurred())
+		hdr, err := iHdr.Parse(b, protocol.PerspectiveServer, versionIETFHeader)
 		Expect(err).ToNot(HaveOccurred())
 		Expect(hdr.IsVersionNegotiation).To(BeTrue())
 		Expect(hdr.DestConnectionID).To(Equal(destConnID))

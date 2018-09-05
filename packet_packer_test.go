@@ -61,7 +61,17 @@ var _ = Describe("Packet packer", func() {
 		maxFrameSize     protocol.ByteCount
 		mockStreamFramer *MockStreamFrameSource
 		divNonce         []byte
+		token            []byte
 	)
+
+	checkPayloadLen := func(data []byte) {
+		r := bytes.NewReader(data)
+		iHdr, err := wire.ParseInvariantHeader(r, 0)
+		Expect(err).ToNot(HaveOccurred())
+		hdr, err := iHdr.Parse(r, protocol.PerspectiveServer, versionIETFFrames)
+		Expect(err).ToNot(HaveOccurred())
+		ExpectWithOffset(0, hdr.PayloadLen).To(BeEquivalentTo(r.Len()))
+	}
 
 	BeforeEach(func() {
 		version := versionGQUICFrames
@@ -69,6 +79,7 @@ var _ = Describe("Packet packer", func() {
 		mockSender.EXPECT().onHasStreamData(gomock.Any()).AnyTimes()
 		mockStreamFramer = NewMockStreamFrameSource(mockCtrl)
 		divNonce = bytes.Repeat([]byte{'e'}, 32)
+		token = []byte("initial token")
 
 		packer = newPacketPacker(
 			protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8},
@@ -76,6 +87,7 @@ var _ = Describe("Packet packer", func() {
 			1,
 			func(protocol.PacketNumber) protocol.PacketNumberLen { return protocol.PacketNumberLen2 },
 			&net.TCPAddr{},
+			token, // token
 			divNonce,
 			&mockCryptoSetup{encLevelSeal: protocol.EncryptionForwardSecure},
 			mockStreamFramer,
@@ -92,22 +104,23 @@ var _ = Describe("Packet packer", func() {
 
 	Context("determining the maximum packet size", func() {
 		connID := protocol.ConnectionID{1, 2, 3, 4, 5, 6, 7, 8}
+
 		It("uses the minimum initial size, if it can't determine if the remote address is IPv4 or IPv6", func() {
 			remoteAddr := &net.TCPAddr{}
-			packer = newPacketPacker(connID, connID, 1, nil, remoteAddr, nil, nil, nil, protocol.PerspectiveServer, protocol.VersionWhatever, nil)
+			packer = newPacketPacker(connID, connID, 1, nil, remoteAddr, nil, nil, nil, nil, protocol.PerspectiveServer, protocol.VersionWhatever, nil)
 			Expect(packer.maxPacketSize).To(BeEquivalentTo(protocol.MinInitialPacketSize))
 		})
 
 		It("uses the maximum IPv4 packet size, if the remote address is IPv4", func() {
 			remoteAddr := &net.UDPAddr{IP: net.IPv4(11, 12, 13, 14), Port: 1337}
-			packer = newPacketPacker(connID, connID, 1, nil, remoteAddr, nil, nil, nil, protocol.PerspectiveServer, protocol.VersionWhatever, nil)
+			packer = newPacketPacker(connID, connID, 1, nil, remoteAddr, nil, nil, nil, nil, protocol.PerspectiveServer, protocol.VersionWhatever, nil)
 			Expect(packer.maxPacketSize).To(BeEquivalentTo(protocol.MaxPacketSizeIPv4))
 		})
 
 		It("uses the maximum IPv6 packet size, if the remote address is IPv6", func() {
 			ip := net.ParseIP("2001:0db8:85a3:0000:0000:8a2e:0370:7334")
 			remoteAddr := &net.UDPAddr{IP: ip, Port: 1337}
-			packer = newPacketPacker(connID, connID, 1, nil, remoteAddr, nil, nil, nil, protocol.PerspectiveServer, protocol.VersionWhatever, nil)
+			packer = newPacketPacker(connID, connID, 1, nil, remoteAddr, nil, nil, nil, nil, protocol.PerspectiveServer, protocol.VersionWhatever, nil)
 			Expect(packer.maxPacketSize).To(BeEquivalentTo(protocol.MaxPacketSizeIPv6))
 		})
 	})
@@ -159,18 +172,24 @@ var _ = Describe("Packet packer", func() {
 				packer.version = versionPublicHeader
 			})
 
-			It("it omits the connection ID for forward-secure packets", func() {
+			It("doesn't set the source connection ID", func() {
 				ph := packer.getHeader(protocol.EncryptionForwardSecure)
-				Expect(ph.OmitConnectionID).To(BeFalse())
+				Expect(ph.SrcConnectionID).To(BeEmpty())
+			})
+
+			It("it omits the connection ID for forward-secure packets", func() {
+				packer.version = protocol.Version43
+				ph := packer.getHeader(protocol.EncryptionForwardSecure)
+				Expect(ph.DestConnectionID.Len()).ToNot(BeZero())
 				packer.SetOmitConnectionID()
 				ph = packer.getHeader(protocol.EncryptionForwardSecure)
-				Expect(ph.OmitConnectionID).To(BeTrue())
+				Expect(ph.DestConnectionID.Len()).To(BeZero())
 			})
 
 			It("doesn't omit the connection ID for non-forward-secure packets", func() {
 				packer.SetOmitConnectionID()
 				ph := packer.getHeader(protocol.EncryptionSecure)
-				Expect(ph.OmitConnectionID).To(BeFalse())
+				Expect(ph.DestConnectionID.Len()).ToNot(BeZero())
 			})
 
 			It("adds the Version Flag to the Public Header before the crypto handshake is finished", func() {
@@ -206,6 +225,52 @@ var _ = Describe("Packet packer", func() {
 					ph := packer.getHeader(protocol.EncryptionSecure)
 					Expect(ph.DiversificationNonce).To(BeEmpty())
 				})
+			})
+		})
+
+		Context("Header (for gQUIC 44)", func() {
+			BeforeEach(func() {
+				packer.version = protocol.Version44
+			})
+
+			It("sends an Initial packet as the first packets, for the client", func() {
+				packer.perspective = protocol.PerspectiveClient
+				packer.hasSentPacket = false
+				h := packer.getHeader(protocol.EncryptionUnencrypted)
+				Expect(h.IsLongHeader).To(BeTrue())
+				Expect(h.Type).To(Equal(protocol.PacketTypeInitial))
+				Expect(h.Version).To(Equal(protocol.Version44))
+				Expect(h.DestConnectionID).To(Equal(packer.destConnID))
+				Expect(h.SrcConnectionID).To(Equal(packer.srcConnID))
+				Expect(h.PacketNumberLen).To(Equal(protocol.PacketNumberLen4))
+			})
+
+			It("sends a Handshake for non-forward-secure packets, for the server", func() {
+				packer.perspective = protocol.PerspectiveServer
+				h := packer.getHeader(protocol.EncryptionUnencrypted)
+				Expect(h.IsLongHeader).To(BeTrue())
+				Expect(h.Type).To(Equal(protocol.PacketTypeHandshake))
+				Expect(h.Version).To(Equal(protocol.Version44))
+				Expect(h.DestConnectionID).To(Equal(packer.destConnID))
+				Expect(h.SrcConnectionID).To(Equal(packer.srcConnID))
+				Expect(h.PacketNumberLen).To(Equal(protocol.PacketNumberLen4))
+			})
+
+			It("sets the Diversification Nonce for secure packets", func() {
+				packer.perspective = protocol.PerspectiveServer
+				Expect(divNonce).ToNot(BeEmpty())
+				h := packer.getHeader(protocol.EncryptionSecure)
+				Expect(h.IsLongHeader).To(BeTrue())
+				Expect(h.Version).To(Equal(protocol.Version44))
+				Expect(h.Type).To(Equal(protocol.PacketType0RTT))
+				Expect(h.DiversificationNonce).To(Equal(divNonce))
+			})
+
+			It("uses the Short Header for forward-secure packets", func() {
+				h := packer.getHeader(protocol.EncryptionForwardSecure)
+				Expect(h.IsLongHeader).To(BeFalse())
+				Expect(h.IsPublicHeader).To(BeFalse())
+				Expect(h.DestConnectionID).To(Equal(packer.destConnID))
 			})
 		})
 
@@ -250,20 +315,6 @@ var _ = Describe("Packet packer", func() {
 				Expect(h.IsLongHeader).To(BeFalse())
 				Expect(h.PacketNumberLen).To(BeNumerically(">", 0))
 			})
-
-			It("it omits the connection ID for forward-secure packets", func() {
-				h := packer.getHeader(protocol.EncryptionForwardSecure)
-				Expect(h.OmitConnectionID).To(BeFalse())
-				packer.SetOmitConnectionID()
-				h = packer.getHeader(protocol.EncryptionForwardSecure)
-				Expect(h.OmitConnectionID).To(BeTrue())
-			})
-
-			It("doesn't omit the connection ID for non-forward-secure packets", func() {
-				packer.SetOmitConnectionID()
-				h := packer.getHeader(protocol.EncryptionSecure)
-				Expect(h.OmitConnectionID).To(BeFalse())
-			})
 		})
 	})
 
@@ -278,11 +329,7 @@ var _ = Describe("Packet packer", func() {
 		mockStreamFramer.EXPECT().PopCryptoStreamFrame(gomock.Any()).Return(f)
 		p, err := packer.PackPacket()
 		Expect(err).ToNot(HaveOccurred())
-		// parse the packet
-		r := bytes.NewReader(p.raw)
-		hdr, err := wire.ParseHeaderSentByServer(r)
-		Expect(err).ToNot(HaveOccurred())
-		Expect(hdr.PayloadLen).To(BeEquivalentTo(r.Len()))
+		checkPayloadLen(p.raw)
 	})
 
 	It("packs a CONNECTION_CLOSE", func() {
@@ -627,11 +674,7 @@ var _ = Describe("Packet packer", func() {
 			expectedPacketLen := packer.maxPacketSize - protocol.NonForwardSecurePacketSizeReduction
 			Expect(p.raw).To(HaveLen(int(expectedPacketLen)))
 			Expect(p.header.IsLongHeader).To(BeTrue())
-			// parse the packet
-			r := bytes.NewReader(p.raw)
-			hdr, err := wire.ParseHeaderSentByServer(r)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(hdr.PayloadLen).To(BeEquivalentTo(r.Len()))
+			checkPayloadLen(p.raw)
 		})
 
 		It("sends unencrypted stream data on the crypto stream", func() {
@@ -789,6 +832,7 @@ var _ = Describe("Packet packer", func() {
 			packer.cryptoSetup.(*mockCryptoSetup).encLevelSealCrypto = protocol.EncryptionUnencrypted
 			packet, err := packer.PackPacket()
 			Expect(err).ToNot(HaveOccurred())
+			Expect(packet.header.Token).To(Equal(token))
 			Expect(packet.raw).To(HaveLen(protocol.MinInitialPacketSize))
 			Expect(packet.frames).To(HaveLen(1))
 			sf := packet.frames[0].(*wire.StreamFrame)
@@ -808,11 +852,7 @@ var _ = Describe("Packet packer", func() {
 			packer.cryptoSetup.(*mockCryptoSetup).encLevelSealCrypto = protocol.EncryptionUnencrypted
 			packet, err := packer.PackPacket()
 			Expect(err).ToNot(HaveOccurred())
-			// parse the header and check the values
-			r := bytes.NewReader(packet.raw)
-			hdr, err := wire.ParseHeaderSentByClient(r)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(hdr.PayloadLen).To(BeEquivalentTo(r.Len()))
+			checkPayloadLen(packet.raw)
 		})
 
 		It("packs a retransmission for an Initial packet", func() {
@@ -829,6 +869,7 @@ var _ = Describe("Packet packer", func() {
 			Expect(p[0].frames).To(Equal([]wire.Frame{sf}))
 			Expect(p[0].encryptionLevel).To(Equal(protocol.EncryptionUnencrypted))
 			Expect(p[0].header.Type).To(Equal(protocol.PacketTypeInitial))
+			Expect(p[0].header.Token).To(Equal(token))
 		})
 
 		It("refuses to retransmit packets without a STOP_WAITING Frame", func() {
